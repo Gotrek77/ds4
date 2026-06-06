@@ -1,18 +1,14 @@
-/ds4
-/ds4-server
-/ds4-bench
-/ds4-eval
-/ds4-agent
-/ds4_native
-/ds4_server_test
-/ds4_test
-/ds4flash.gguf
-/TODO.md
-/gguf/
+# SRM test binaries
+ds4-srm
+ds4-srm-asan
+ds4-srm-dbg
+ds4-srm-test
+ds4-srm-test-asan
+ds4-srm-test-ubsan
+/tmp/srm_tool_runner
+
+# backups
+*.bak
+
+# build
 *.o
-*.dSYM/
-__pycache__/
-*.pyc
-/misc/
-.*.swp
-.DS_Store
