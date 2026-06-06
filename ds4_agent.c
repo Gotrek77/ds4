@@ -29,6 +29,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/* In-process SRM tool — declared in srm_tool.c, linked separately.
+ * Returns a JSON string that the caller must free with free(). */
+char *srm_tool_exec(const char *action, const char *statement);
+bool   srm_tool_load_kb(const char *path);
+bool   srm_tool_save_kb(const char *path);
+
 /* This is intentionally not in linenoise.h, but it is part of the existing
  * multiplexed editor implementation.  The agent uses it only to restore text
  * after Enter is pressed while the model is still busy. */
@@ -929,6 +935,29 @@ static const char agent_tools_prompt_after_edit[] =
     "        \"path\": {\"type\": \"string\"}\n"
     "      },\n"
     "      \"required\": [\"path\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"srm\",\n"
+    "    \"description\": \"Symbolic Reasoning Module: assert facts/rules, query with variables, solve constraints, evaluate expressions. "
+    "Actions: assert, query, solve, eval, save, load, reset.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"action\": {\n"
+    "          \"type\": \"string\",\n"
+    "          \"enum\": [\"assert\", \"query\", \"solve\", \"eval\", \"save\", \"load\", \"reset\"],\n"
+    "          \"description\": \"Action to perform\"\n"
+    "        },\n"
+    "        \"statement\": {\n"
+    "          \"type\": \"string\",\n"
+    "          \"description\": \"Statement for assert/query/eval/save/load actions\"\n"
+    "        }\n"
+    "      },\n"
+    "      \"required\": [\"action\"]\n"
     "    }\n"
     "  }\n"
     "}\n"
@@ -4266,6 +4295,10 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     pthread_mutex_unlock(&w->mu);
     w->datetime_context_injected = false;
     agent_worker_clear_session_identity(w);
+
+    /* Auto-load SRM KB if it exists */
+    srm_tool_load_kb("~/.ds4/srm.kb");
+
     free(text);
     ds4_tokens_free(&sys);
     return true;
@@ -6550,10 +6583,28 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
     return agent_buf_take(&out);
 }
 
+static char *agent_tool_srm(agent_worker *w, const agent_tool_call *call) {
+    (void)w;
+    const char *action = agent_tool_arg_value(call, "action");
+    const char *statement = agent_tool_arg_value(call, "statement");
+    if (!action || !action[0]) return xstrdup("Tool error: srm requires action\n");
+    if (!statement) statement = "";
+
+    /* Call the in-process SRM library directly (no subprocess). */
+    char *json = srm_tool_exec(action, statement);
+    if (!json) json = xstrdup("Tool error: srm_tool_exec returned NULL\n");
+
+    /* The JSON result is the tool output — prefix a label for readability. */
+    agent_buf out = {0};
+    agent_buf_puts(&out, json);
+    free(json);
+    if (!out.ptr) agent_buf_puts(&out, "(no output)\n");
+    return agent_buf_take(&out);
+}
+
 /* ============================================================================
  * Asynchronous Bash Jobs
- * ============================================================================
- *
+[upto]
  * Bash commands are tracked jobs, not blocking one-shot calls.  Each job owns a
  * process, a pipe, and a secure /tmp output file.  The first observation is
  * head-biased so headers and early errors are visible; later progress updates
@@ -7047,6 +7098,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
+    if (!strcmp(call->name, "srm")) return agent_tool_srm(w, call);
 
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
@@ -7232,6 +7284,9 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         ds4_tokens_free(&sys);
         return true;
     }
+
+    /* Auto-save SRM KB before compaction so facts survive summary */
+    srm_tool_save_kb("~/.ds4/srm.kb");
 
     agent_publishf(w,
         "\n\x1b[1;95mCOMPACTING\x1b[0m %s: summarizing durable task state\n\x1b[38;5;245m",
@@ -9464,6 +9519,8 @@ typedef enum {
  * restored, declining the save can terminate immediately and let the OS reclaim
  * model/Metal resources instead of waiting for orderly teardown. */
 static agent_exit_save_result agent_maybe_save_before_exiting(agent_worker *w) {
+    /* Auto-save SRM KB before exit */
+    srm_tool_save_kb("~/.ds4/srm.kb");
     if (!agent_worker_needs_save(w)) return AGENT_EXIT_CLEAN;
     if (!agent_prompt_yes_no("Save current session? (y/n) ")) return AGENT_EXIT_NOW;
     char err[160] = {0};

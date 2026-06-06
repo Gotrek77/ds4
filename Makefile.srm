@@ -1,0 +1,22 @@
+# Makefile.srm — Build and test for ds4-srm standalone tool
+# Copyright (C) 2025 DwarfStar authors. See LICENSE for terms.
+
+CC      ?= cc
+CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-variable -g
+LDFLAGS ?= -lm
+
+.PHONY: all test clean
+
+all: ds4-srm ds4-srm-test
+
+ds4-srm: ds4-srm.c
+	$(CC) $(CFLAGS) -o ds4-srm ds4-srm.c $(LDFLAGS)
+
+ds4-srm-test: ds4-srm-test.c ds4-srm.c
+	$(CC) $(CFLAGS) -I. -o ds4-srm-test ds4-srm-test.c $(LDFLAGS)
+
+test: ds4-srm-test
+	./ds4-srm-test
+
+clean:
+	rm -f ds4-srm ds4-srm-test
