@@ -6,7 +6,9 @@
  * Copyright (C) 2025 DwarfStar authors. See LICENSE for terms.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,7 +92,7 @@ void srm_buf_putf(srm_buf *b, const char *fmt, ...) {
         int r = vsnprintf(b->buf + b->len, n, fmt, ap2);
         va_end(ap2);
         if (r >= 0 && (size_t)r < n) { b->len += r; break; }
-        n = (size_t)(r >= 0 ? r + 1 : n * 2);
+        n = (size_t)(r >= 0 ? (size_t)r + 1 : n * 2);
     }
     va_end(ap);
 }
@@ -382,6 +384,65 @@ static bool srm_match_one_fact(srm_kb *kb, const srm_literal *lit,
     return false;
 }
 
+/* Forward declaration for recursive call from arithmetic evaluator */
+static int srm_forward_match_rule(srm_kb *kb, srm_rule *r, int body_idx,
+                                  srm_subst *subst);
+
+/* Check if a term is a variable and bound in subst; return value if integer. */
+static bool srm_get_bound_int(const srm_subst *subst, const srm_term *t, int *val) {
+    if (t->type == SRM_INT) { *val = t->ival; return true; }
+    if (t->type == SRM_VAR) {
+        srm_term *found = srm_subst_lookup((srm_subst*)subst, t->name);
+        if (found && found->type == SRM_INT) { *val = found->ival; return true; }
+    }
+    return false;
+}
+
+/* Try to evaluate an arithmetic body literal. If all inputs are bound,
+ * compute result, bind output variable in subst, and continue to next body.
+ * Returns number of derived facts (>=0) or -1 if not an arithmetic literal. */
+static int srm_forward_eval_arith(srm_kb *kb, srm_rule *r, int body_idx,
+                                  srm_subst *subst)
+{
+    srm_literal *lit = &r->body[body_idx];
+    const char *pred = lit->predicate;
+
+    /* Determine arithmetic operation */
+    int op = -1;
+    if      (!strcmp(pred, "add")) op = 0;
+    else if (!strcmp(pred, "sub")) op = 1;
+    else if (!strcmp(pred, "mul")) op = 2;
+    else if (!strcmp(pred, "div")) op = 3;
+    else if (!strcmp(pred, "min")) op = 4;
+
+    if (op < 0) return -1; /* not arithmetic */
+
+    if (lit->arity < 3) return 0;
+
+    /* Inputs: args[0] and args[1]; output: args[2] */
+    int a, b, c;
+    if (!srm_get_bound_int(subst, &lit->args[0], &a)) return 0;
+    if (!srm_get_bound_int(subst, &lit->args[1], &b)) return 0;
+
+    switch (op) {
+        case 0: c = a + b; break;
+        case 1: c = a - b; break;
+        case 2: c = a * b; break;
+        case 3: if (b == 0) return 0; c = a / b; break;
+        case 4: c = (a < b) ? a : b; break;
+        default: return 0;
+    }
+
+    /* Bind output variable */
+    if (lit->args[2].type != SRM_VAR) return 0;
+    srm_term tval = srm_term_int(c);
+    srm_subst_set(subst, lit->args[2].name, tval);
+    srm_term_free(&tval);
+
+    /* Continue with next body literal */
+    return srm_forward_match_rule(kb, r, body_idx + 1, subst);
+}
+
 /* Backtracking matcher: given a list of body literals and a KB, find all
  * substitutions that satisfy ALL body literals simultaneously. For each
  * valid substitution, apply to head and add as fact.
@@ -406,6 +467,13 @@ static int srm_forward_match_rule(srm_kb *kb, srm_rule *r, int body_idx,
         srm_kb_add_fact(kb, &derived);
         srm_literal_free(&derived);
         return 1;
+    }
+
+    /* Try arithmetic evaluation for this body literal first */
+    int arith_result = srm_forward_eval_arith(kb, r, body_idx, subst);
+    if (arith_result >= 0) {
+        /* Either evaluated (>0) or failed (=0). No fact-matching needed. */
+        return arith_result;
     }
 
     int added = 0;
@@ -680,13 +748,31 @@ static srm_token srm_parser_next(srm_parser *p) {
 
     /* Single-character symbols */
     if (c == '(' || c == ')' || c == ',' || c == '.' ||
-        c == '?' || c == '=' || c == '>' || c == '<' ||
-        c == '+' || c == '-' || c == '/' || c == '[' || c == ']')
+        c == '?' ||
+        c == '+' || c == '-' || c == '*' || c == '/' || c == '[' || c == ']')
     {
         tok.text = xmalloc(2);
         tok.text[0] = c; tok.text[1] = '\0';
         tok.len = 1;
         p->pos++;
+        return tok;
+    }
+
+    /* Comparison operators (single and multi-char): !=, >=, <=, >, <, = */
+    if (c == '!' || c == '>' || c == '<' || c == '=') {
+        int start = p->pos;
+        p->pos++;
+        if (p->s[p->pos] == '=') {
+            tok.text = xmalloc(3);
+            tok.text[0] = c; tok.text[1] = '='; tok.text[2] = '\0';
+            tok.len = 2;
+            p->pos++;
+            return tok;
+        }
+        /* Single-char version (e.g., just !) */
+        tok.text = xmalloc(2);
+        tok.text[0] = c; tok.text[1] = '\0';
+        tok.len = 1;
         return tok;
     }
 
@@ -730,11 +816,19 @@ static srm_token srm_parser_next(srm_parser *p) {
         return tok;
     }
 
-    /* Variable (uppercase start) or atom (lowercase start or other) */
+    /* Variable (uppercase start) or atom (lowercase start or other).
+     * Also catches any otherwise unhandled character as a single-char atom. */
     int start = p->pos;
-    while (p->s[p->pos] && (isalpha(p->s[p->pos]) || p->s[p->pos] == '_' ||
-           (p->s[p->pos] >= '0' && p->s[p->pos] <= '9')))
+    if (isalpha(p->s[p->pos]) || p->s[p->pos] == '_' ||
+        (p->s[p->pos] >= '0' && p->s[p->pos] <= '9'))
+    {
+        while (p->s[p->pos] && (isalpha(p->s[p->pos]) || p->s[p->pos] == '_' ||
+               (p->s[p->pos] >= '0' && p->s[p->pos] <= '9')))
+            p->pos++;
+    } else {
+        /* single character atom (handles any otherwise unhandled char) */
         p->pos++;
+    }
     tok.text = xmalloc(p->pos - start + 1);
     memcpy(tok.text, p->s + start, p->pos - start);
     tok.text[p->pos - start] = '\0';
@@ -765,6 +859,11 @@ static srm_literal srm_parse_literal(srm_parser *p, char *err, size_t err_len) {
     srm_term args[16];
     int arity = 0;
     while (srm_parser_peek(p) != ')' && !srm_parser_eof(p)) {
+        if (arity >= 16) {
+            snprintf(err, err_len, "too many arguments (max 16)");
+            srm_literal_free(&lit);
+            return lit;
+        }
         srm_token atok = srm_parser_next(p);
         if (!atok.text) break;
         if (srm_is_var(atok.text)) {
@@ -825,7 +924,6 @@ int srm_parse_line(const char *line, srm_literal *out_fact,
 
     /* Check for rule: ← after head */
     srm_parser_skip_spaces(&p);
-    int save = p.pos;
     srm_token next = srm_parser_next(&p);
     bool is_rule = false;
     if (next.text) {
@@ -859,6 +957,12 @@ int srm_parse_line(const char *line, srm_literal *out_fact,
     srm_literal body[16];
     int body_len = 0;
     while (!srm_parser_eof(&p) && srm_parser_peek(&p) != '.') {
+        if (body_len >= 16) {
+            snprintf(err, err_len, "too many body literals (max 16)");
+            srm_literal_free(&head);
+            for (int i = 0; i < body_len; i++) srm_literal_free(&body[i]);
+            return -1;
+        }
         body[body_len] = srm_parse_literal(&p, err, err_len);
         if (!body[body_len].predicate) break;
         body_len++;
@@ -1034,33 +1138,283 @@ static srm_csp_var *srm_csp_find(srm_csp *csp, const char *name) {
     return NULL;
 }
 
-/* Evaluate a binary constraint */
-static bool srm_csp_check(srm_csp *csp, const char *op,
-                          const char *a, const char *b, int rhs)
+/* Ensure a variable exists in the CSP, adding it with default range [0,10] if not found */
+static void srm_csp_ensure_var(srm_csp *csp, const char *name) {
+    if (!srm_csp_find(csp, name)) {
+        srm_csp_add_var(csp, name, 0, 10);
+    }
+}
+
+/* Evaluate a binary constraint — extended with results array for arithmetic ops */
+static bool srm_csp_check_ex(srm_csp *csp, const char *op,
+                             const char *a, const char *b,
+                             const char *res, int rhs)
 {
     srm_csp_var *va = srm_csp_find(csp, a);
-    srm_csp_var *vb = srm_csp_find(csp, b);
-    if (!va || !vb) return false;
+    srm_csp_var *vb = b ? srm_csp_find(csp, b) : NULL;
+    srm_csp_var *vr = res ? srm_csp_find(csp, res) : NULL;
+    if (!va) return false;
+
+    /* Constant equality: A = N (no right operand needed) */
+    if (!strcmp(op, "const")) {
+        if (!va->assigned) return true;
+        return va->value == rhs;
+    }
+
+    /* Comparison with constant: A > N, A < N, A >= N, A <= N, A != N */
+    if (!vb && (!strcmp(op, ">") || !strcmp(op, "<") ||
+                !strcmp(op, ">=") || !strcmp(op, "<=") || !strcmp(op, "!=")))
+    {
+        if (!va->assigned) return true;
+        int av = va->value;
+        if (!strcmp(op, ">"))   return av > rhs;
+        if (!strcmp(op, "<"))   return av < rhs;
+        if (!strcmp(op, ">="))  return av >= rhs;
+        if (!strcmp(op, "<="))  return av <= rhs;
+        if (!strcmp(op, "!="))  return av != rhs;
+    }
+
+    /* For binary operators, require both operands */
+    if (!vb) return false;
     if (!va->assigned || !vb->assigned) return true; /* not yet assigned */
+
     int av = va->value, bv = vb->value;
-    if (!strcmp(op, "=")) return av + bv == rhs;
+    if (!strcmp(op, "=")) return av == bv;
     if (!strcmp(op, ">")) return av > bv;
     if (!strcmp(op, "<")) return av < bv;
     if (!strcmp(op, ">=")) return av >= bv;
     if (!strcmp(op, "<=")) return av <= bv;
+    if (!strcmp(op, "!=")) return av != bv;
+
+    /* Arithmetic with result variable */
+    if (!strcmp(op, "+")) {
+        if (vr) {
+            if (!vr->assigned) return true;
+            return av + bv == vr->value;
+        }
+        return av + bv == rhs;
+    }
+    if (!strcmp(op, "-")) {
+        if (vr) {
+            if (!vr->assigned) return true;
+            return av - bv == vr->value;
+        }
+        return av - bv == rhs;
+    }
+    if (!strcmp(op, "*")) {
+        if (vr) {
+            if (!vr->assigned) return true;
+            return av * bv == vr->value;
+        }
+        return av * bv == rhs;
+    }
+    if (!strcmp(op, "/")) {
+        if (vr) {
+            if (!vr->assigned) return true;
+            return bv != 0 && av / bv == vr->value;
+        }
+        return bv != 0 && av / bv == rhs;
+    }
+
     return false;
 }
 
-/* Solve CSP by backtracking */
+/* Forward propagation: after assigning a variable, try to deduce values
+ * for result variables in arithmetic constraints where both inputs are known,
+ * and propagate numeric RHS constraints (A + B = N) when one operand is known.
+ * Returns false if a contradiction is detected. */
+static bool srm_csp_propagate(srm_csp *csp,
+                              const char **ops, const char **lefts,
+                              const char **rights, const char **results,
+                              int *rhss, int nops)
+{
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < nops; i++) {
+            if (strcmp(ops[i], "+") && strcmp(ops[i], "-") &&
+                strcmp(ops[i], "*") && strcmp(ops[i], "/"))
+                continue;
+
+            srm_csp_var *va = srm_csp_find(csp, lefts[i]);
+            srm_csp_var *vb = srm_csp_find(csp, rights[i]);
+            if (!va || !vb) return false;
+
+            if (results[i]) {
+                /* Arithmetic with result variable: A op B = C */
+                srm_csp_var *vr = srm_csp_find(csp, results[i]);
+                if (!vr) return false;
+                if (!va->assigned || !vb->assigned) continue;
+                if (vr->assigned) continue;
+
+                /* Both inputs known, result unknown — compute it */
+                int av = va->value, bv = vb->value;
+                int cv;
+                if (!strcmp(ops[i], "+")) cv = av + bv;
+                else if (!strcmp(ops[i], "-")) cv = av - bv;
+                else if (!strcmp(ops[i], "*")) cv = av * bv;
+                else if (!strcmp(ops[i], "/")) { if (bv == 0) return false; cv = av / bv; }
+                else continue;
+
+                if (cv < vr->lo || cv > vr->hi) return false;
+                vr->value = cv;
+                vr->assigned = true;
+                changed = true;
+            } else {
+                /* Numeric RHS: A op B = N */
+                int rhs = rhss[i];
+
+                if (va->assigned && !vb->assigned) {
+                    /* Left known, right unknown — compute right */
+                    int av = va->value;
+                    int bv;
+                    if (!strcmp(ops[i], "+")) bv = rhs - av;
+                    else if (!strcmp(ops[i], "-")) bv = av - rhs;
+                    else if (!strcmp(ops[i], "*")) {
+                        if (av == 0) continue;
+                        if (rhs % av != 0) return false;
+                        bv = rhs / av;
+                    }
+                    else if (!strcmp(ops[i], "/")) {
+                        if (rhs == 0) { bv = 0; } /* A / B = 0 → B can be anything > A */
+                        else continue; /* not invertible simply */
+                    }
+                    else continue;
+
+                    if (bv < vb->lo || bv > vb->hi) return false;
+                    vb->value = bv;
+                    vb->assigned = true;
+                    changed = true;
+                } else if (!va->assigned && vb->assigned) {
+                    /* Right known, left unknown — compute left */
+                    int bv = vb->value;
+                    int av;
+                    if (!strcmp(ops[i], "+")) av = rhs - bv;
+                    else if (!strcmp(ops[i], "-")) av = rhs + bv;
+                    else if (!strcmp(ops[i], "*")) {
+                        if (bv == 0) continue;
+                        if (rhs % bv != 0) return false;
+                        av = rhs / bv;
+                    }
+                    else if (!strcmp(ops[i], "/")) {
+                        if (bv == 0) continue;
+                        av = rhs * bv;
+                    }
+                    else continue;
+
+                    if (av < va->lo || av > va->hi) return false;
+                    va->value = av;
+                    va->assigned = true;
+                    changed = true;
+                }
+                /* Both assigned: will be checked at leaf */
+            }
+        }
+    }
+    return true;
+}
+
+/* Forward checking: after assigning a variable, check all comparison
+ * constraints involving it. For each constraint where the other variable
+ * is unassigned, verify that there exists at least one value in its domain
+ * that satisfies the constraint. Returns false if a dead-end is detected. */
+static bool srm_csp_forward_check(srm_csp *csp, int just_assigned_idx,
+                                  const char **ops, const char **lefts,
+                                  const char **rights, int *rhss, int nops)
+{
+    for (int i = 0; i < nops; i++) {
+        /* Only handle comparison constraints (no result var) */
+        if (strcmp(ops[i], ">") && strcmp(ops[i], "<") &&
+            strcmp(ops[i], ">=") && strcmp(ops[i], "<=") &&
+            strcmp(ops[i], "=") && strcmp(ops[i], "!="))
+            continue;
+
+        srm_csp_var *va = srm_csp_find(csp, lefts[i]);
+
+        if (rights[i]) {
+            /* Variable-variable comparison: A op B */
+            srm_csp_var *vb = srm_csp_find(csp, rights[i]);
+            if (!va || !vb) return false;
+
+            /* Skip if both are assigned (will be checked at leaf) */
+            if (va->assigned && vb->assigned) continue;
+
+            /* Skip if neither involves the just-assigned variable */
+            int ai = va - csp->vars;
+            int bi = vb - csp->vars;
+            if (ai != just_assigned_idx && bi != just_assigned_idx) continue;
+
+            /* One is assigned, the other is not — check feasibility */
+            srm_csp_var *assigned_var = va->assigned ? va : (vb->assigned ? vb : NULL);
+            srm_csp_var *unassigned_var = va->assigned ? vb : va;
+            if (!assigned_var || !unassigned_var) continue;
+            if (unassigned_var->assigned) continue;
+
+            int av = assigned_var->value;
+            int lo = unassigned_var->lo;
+            int hi = unassigned_var->hi;
+            bool found = false;
+            bool a_is_left = (assigned_var == va);
+
+            for (int val = lo; val <= hi; val++) {
+                int left_val  = a_is_left ? av : val;
+                int right_val = a_is_left ? val : av;
+                bool ok = false;
+                if (!strcmp(ops[i], ">"))   ok = left_val > right_val;
+                else if (!strcmp(ops[i], "<"))   ok = left_val < right_val;
+                else if (!strcmp(ops[i], ">="))  ok = left_val >= right_val;
+                else if (!strcmp(ops[i], "<="))  ok = left_val <= right_val;
+                else if (!strcmp(ops[i], "="))   ok = left_val == right_val;
+                else if (!strcmp(ops[i], "!="))  ok = left_val != right_val;
+                if (ok) { found = true; break; }
+            }
+            if (!found) return false;
+        } else {
+            /* Variable-constant comparison: A op N */
+            if (!va) return false;
+            int ai = va - csp->vars;
+            if (ai != just_assigned_idx) continue;
+            if (!va->assigned) continue;
+
+            /* A is assigned, check if value satisfies A op N */
+            int av = va->value;
+            bool ok = false;
+            if (!strcmp(ops[i], ">"))   ok = av > rhss[i];
+            else if (!strcmp(ops[i], "<"))   ok = av < rhss[i];
+            else if (!strcmp(ops[i], ">="))  ok = av >= rhss[i];
+            else if (!strcmp(ops[i], "<="))  ok = av <= rhss[i];
+            else if (!strcmp(ops[i], "!="))  ok = av != rhss[i];
+            if (!ok) return false;
+        }
+    }
+    return true;
+}
+
+/* Save/restore assignment state for propagation */
+static void srm_csp_save_assigned(srm_csp *csp, bool *saved, int *n_saved) {
+    *n_saved = 0;
+    for (int i = 0; i < csp->nvars; i++)
+        if (csp->vars[i].assigned) saved[(*n_saved)++] = true;
+}
+static void srm_csp_restore_assigned(srm_csp *csp, const bool *saved, int n_saved) {
+    /* Clear assignments beyond saved count */
+    for (int i = 0; i < csp->nvars; i++) {
+        if (i < n_saved) csp->vars[i].assigned = saved[i];
+        else csp->vars[i].assigned = false;
+    }
+}
+
+/* Solve CSP by backtracking — extended with results array */
 static bool srm_csp_solve(srm_csp *csp, int var_idx,
                           const char **ops, const char **lefts,
-                          const char **rights, int *rhss, int nops,
+                          const char **rights, const char **results,
+                          int *rhss, int nops,
                           srm_buf *solutions, int max_solutions)
 {
     if (var_idx >= csp->nvars) {
         /* All variables assigned; check constraints */
         for (int i = 0; i < nops; i++) {
-            if (!srm_csp_check(csp, ops[i], lefts[i], rights[i], rhss[i]))
+            if (!srm_csp_check_ex(csp, ops[i], lefts[i], rights[i], results[i], rhss[i]))
                 return false;
         }
         /* Valid solution */
@@ -1073,24 +1427,56 @@ static bool srm_csp_solve(srm_csp *csp, int var_idx,
     }
 
     srm_csp_var *v = &csp->vars[var_idx];
+
+    /* Skip already-assigned variables (propagated by forward checking) */
+    if (v->assigned) {
+        return srm_csp_solve(csp, var_idx + 1, ops, lefts, rights, results, rhss, nops,
+                             solutions, max_solutions);
+    }
+
     int count = 0;
+    /* Buffer for saving assignment state (max 32 vars) */
+    bool saved_assigned[32];
+    int n_saved;
+
     for (int val = v->lo; val <= v->hi; val++) {
         v->value = val;
         v->assigned = true;
-        if (srm_csp_solve(csp, var_idx + 1, ops, lefts, rights, rhss, nops,
+
+        /* Save state before propagation */
+        srm_csp_save_assigned(csp, saved_assigned, &n_saved);
+
+        /* Propagate arithmetic constraints */
+        if (!srm_csp_propagate(csp, ops, lefts, rights, results, rhss, nops)) {
+            srm_csp_restore_assigned(csp, saved_assigned, n_saved);
+            v->assigned = true;
+            continue;
+        }
+        /* Forward check comparison constraints */
+        if (!srm_csp_forward_check(csp, var_idx, ops, lefts, rights, rhss, nops)) {
+            srm_csp_restore_assigned(csp, saved_assigned, n_saved);
+            v->assigned = true;
+            continue;
+        }
+
+        if (srm_csp_solve(csp, var_idx + 1, ops, lefts, rights, results, rhss, nops,
                           solutions, max_solutions))
             count++;
         if (max_solutions > 0 && count >= max_solutions) break;
+
+        /* Restore pre-propagation state */
+        srm_csp_restore_assigned(csp, saved_assigned, n_saved);
+        v->assigned = true; /* re-set since restore clears it */
     }
     v->assigned = false;
     return count > 0;
 }
 
-/* Parse a constraint line and add to CSP */
+/* Parse a constraint line and add to CSP — extended with results array */
 static void srm_csp_add_constraint(srm_csp *csp, const char *line,
                                    const char **ops, const char **lefts,
-                                   const char **rights, int *rhss, int *nops,
-                                   int max_ops)
+                                   const char **rights, const char **results,
+                                   int *rhss, int *nops, int max_ops)
 {
     srm_parser p;
     srm_parser_init(&p, line);
@@ -1102,7 +1488,9 @@ static void srm_csp_add_constraint(srm_csp *csp, const char *line,
         free(tok.text);
         srm_parser_next(&p); /* skip ( */
         srm_token var = srm_parser_next(&p);
-        srm_parser_next(&p); /* skip int */
+        srm_parser_next(&p); /* skip , */
+        srm_parser_next(&p); /* skip "int" */
+        srm_parser_next(&p); /* skip , */
         srm_token lo = srm_parser_next(&p);
         srm_parser_next(&p); /* skip , */
         srm_token hi = srm_parser_next(&p);
@@ -1116,44 +1504,150 @@ static void srm_csp_add_constraint(srm_csp *csp, const char *line,
     }
     free(tok.text);
 
-    /* Parse arithmetic: A + B = N  or  A > B etc */
-    /* We re-parse from start */
+    /* Check for VAR in [LO, HI] */
+    /* Re-parse: first token is the variable name, second should be "in" */
+    srm_parser_init(&p, line);
+    srm_token var = srm_parser_next(&p);
+    srm_token in_tok = srm_parser_next(&p);
+    if (var.text && in_tok.text && !strcmp(in_tok.text, "in")) {
+        srm_token lb = srm_parser_next(&p); /* [ */
+        srm_token lo = srm_parser_next(&p);
+        srm_token comma = srm_parser_next(&p);
+        srm_token hi = srm_parser_next(&p);
+        srm_token rb = srm_parser_next(&p); /* ] */
+        if (lo.text && hi.text && lb.text && rb.text && comma.text &&
+            !strcmp(lb.text, "[") && !strcmp(rb.text, "]")) {
+            int lov = atoi(lo.text);
+            int hiv = atoi(hi.text);
+            srm_csp_add_var(csp, var.text, lov, hiv);
+        }
+        free(var.text); free(in_tok.text); free(lo.text); free(hi.text);
+        free(lb.text); free(rb.text); free(comma.text);
+        return;
+    }
+    free(var.text); free(in_tok.text);
+
+    /* Parse arithmetic: A + B = C/N, A - B = C/N, A * B = C/N, A / B = C/N,
+     * or comparisons: A > B, A < B, A >= B, A <= B, A = B
+     * or constant: A = N */
     srm_parser_init(&p, line);
     srm_token a = srm_parser_next(&p);
     srm_token op = srm_parser_next(&p);
-    if (!strcmp(op.text, "+")) {
+    if (!op.text || !a.text) { free(a.text); free(op.text); return; }
+
+    /* Check if this is "A = N" (constant assignment) or "A = B" (variable equality) */
+    if (!strcmp(op.text, "=")) {
+        srm_token b = srm_parser_next(&p);
+        if (b.text) {
+            /* Auto-create left variable */
+            srm_csp_ensure_var(csp, a.text);
+            /* Check if b is a number or variable */
+            if (b.text[0] >= '0' && b.text[0] <= '9') {
+                /* A = N (constant) */
+                if (*nops < max_ops) {
+                    ops[*nops] = xstrdup("const");
+                    lefts[*nops] = xstrdup(a.text);
+                    rights[*nops] = NULL;
+                    results[*nops] = NULL;
+                    rhss[*nops] = atoi(b.text);
+                    (*nops)++;
+                }
+            } else {
+                /* A = B (variable equality) — auto-create B */
+                srm_csp_ensure_var(csp, b.text);
+                if (*nops < max_ops) {
+                    ops[*nops] = xstrdup("=");
+                    lefts[*nops] = xstrdup(a.text);
+                    rights[*nops] = xstrdup(b.text);
+                    results[*nops] = NULL;
+                    rhss[*nops] = 0;
+                    (*nops)++;
+                }
+            }
+            free(b.text);
+        }
+        free(a.text); free(op.text);
+        return;
+    }
+
+    /* Binary arithmetic: A op B = C  or  A op B = N */
+    if (!strcmp(op.text, "+") || !strcmp(op.text, "-") ||
+        !strcmp(op.text, "*") || !strcmp(op.text, "/"))
+    {
         srm_token b = srm_parser_next(&p);
         srm_token eq = srm_parser_next(&p);
         srm_token rhs = srm_parser_next(&p);
         if (a.text && b.text && rhs.text && eq.text && !strcmp(eq.text, "=")) {
+            /* Auto-create variables if they don't exist */
+            srm_csp_ensure_var(csp, a.text);
+            srm_csp_ensure_var(csp, b.text);
+            if (rhs.text[0] >= '0' && rhs.text[0] <= '9') {
+                /* Numeric RHS — no variable needed */
+            } else {
+                srm_csp_ensure_var(csp, rhs.text);
+            }
             if (*nops < max_ops) {
-                ops[*nops] = xstrdup("=");
-                lefts[*nops] = xstrdup(a.text);
-                rights[*nops] = xstrdup(b.text);
-                rhss[*nops] = atoi(rhs.text);
+                /* Check if rhs is a number or variable */
+                if (rhs.text[0] >= '0' && rhs.text[0] <= '9') {
+                    /* A op B = N (numeric result) */
+                    ops[*nops] = xstrdup(op.text);
+                    lefts[*nops] = xstrdup(a.text);
+                    rights[*nops] = xstrdup(b.text);
+                    results[*nops] = NULL;
+                    rhss[*nops] = atoi(rhs.text);
+                } else {
+                    /* A op B = C (variable result) */
+                    ops[*nops] = xstrdup(op.text);
+                    lefts[*nops] = xstrdup(a.text);
+                    rights[*nops] = xstrdup(b.text);
+                    results[*nops] = xstrdup(rhs.text);
+                    rhss[*nops] = 0;
+                }
                 (*nops)++;
             }
         }
         free(a.text); free(b.text); free(rhs.text);
-    } else if (!strcmp(op.text, ">") || !strcmp(op.text, "<") ||
-               !strcmp(op.text, ">=") || !strcmp(op.text, "<=") ||
-               !strcmp(op.text, "="))
+        free(op.text);
+        return;
+    }
+
+    /* Comparisons: A > B, A < B, A >= B, A <= B, A != B, A = B (already handled above) */
+    if (!strcmp(op.text, ">") || !strcmp(op.text, "<") ||
+        !strcmp(op.text, ">=") || !strcmp(op.text, "<=") ||
+        !strcmp(op.text, "!="))
     {
         srm_token b = srm_parser_next(&p);
         if (a.text && b.text) {
+            /* Auto-create left variable */
+            srm_csp_ensure_var(csp, a.text);
             if (*nops < max_ops) {
-                ops[*nops] = xstrdup(op.text);
-                lefts[*nops] = xstrdup(a.text);
-                rights[*nops] = xstrdup(b.text);
-                rhss[*nops] = 0;
+                /* Check if right side is a number (A > N) */
+                if (b.text[0] >= '0' && b.text[0] <= '9') {
+                    /* A op N (comparison with constant) */
+                    ops[*nops] = xstrdup(op.text);
+                    lefts[*nops] = xstrdup(a.text);
+                    rights[*nops] = NULL;
+                    results[*nops] = NULL;
+                    rhss[*nops] = atoi(b.text);
+                } else {
+                    /* A op B (variable comparison) — auto-create B */
+                    srm_csp_ensure_var(csp, b.text);
+                    ops[*nops] = xstrdup(op.text);
+                    lefts[*nops] = xstrdup(a.text);
+                    rights[*nops] = xstrdup(b.text);
+                    results[*nops] = NULL;
+                    rhss[*nops] = 0;
+                }
                 (*nops)++;
             }
         }
         free(a.text); free(b.text);
-    } else {
-        /* unknown constraint, skip */
+        free(op.text);
+        return;
     }
-    free(op.text);
+
+    /* unknown constraint, skip */
+    free(a.text); free(op.text);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1307,6 +1801,169 @@ bool srm_assert_rule(srm_kb *kb, const char *text) {
 
 #endif /* SRM_LIBRARY_MODE */
 
+/* ─── Water jug BFS solver ─────────────────────────────────────────────── */
+
+/* Jug capacities */
+#define WJ_12 12
+#define WJ_7   7
+#define WJ_5   5
+
+/* A state: amounts in each jug */
+typedef struct {
+    int a12, a7, a5;
+    int parent;   /* index of parent state in the BFS queue (-1 = none) */
+    int action;   /* action that led to this state (0=fill,1=empty,2=pour) */
+    int from, to; /* for pour actions */
+} wj_state;
+
+/* Compute unique hash for a state (compact: max 13*8*6 = 624 states) */
+#define WJ_HASH(a12,a7,a5) ((a12) * 8 * 6 + (a7) * 6 + (a5))
+
+/* BFS search for water jug problem. goal: target amount in 12L jug.
+ * Returns a string describing the solution path, or NULL if no solution. */
+static char *srm_water_jug(int goal, int max_states) {
+    wj_state *queue = xmalloc(sizeof(wj_state) * max_states);
+    int head = 0, tail = 0;
+
+    /* Visited set (compact: max 13*8*6 = 624 states) */
+#define WJ_MAX_HASH ((12+1)*(7+1)*(5+1) + 1)
+    bool *visited = xmalloc(sizeof(bool) * WJ_MAX_HASH);
+    memset(visited, 0, sizeof(bool) * WJ_MAX_HASH);
+
+    /* Initial state: 12L full, others empty */
+    queue[tail++] = (wj_state){12, 0, 0, -1, -1, 0, 0};
+    visited[WJ_HASH(12,0,0)] = true;
+    
+    while (head < tail) {
+        wj_state cur = queue[head++];
+        int a12 = cur.a12, a7 = cur.a7, a5 = cur.a5;
+
+        /* Check goal */
+        if (a12 == goal) {
+            /* Reconstruct path */
+            srm_buf path;
+            srm_buf_init(&path);
+            int idx = head - 1;
+            /* Collect actions in reverse */
+            int steps[256], nsteps = 0;
+            while (idx >= 0) {
+                wj_state *s = &queue[idx];
+                if (s->parent >= 0) steps[nsteps++] = idx;
+                idx = s->parent;
+            }
+            /* Print in forward order */
+            for (int i = nsteps - 1; i >= 0; i--) {
+                wj_state *s = &queue[steps[i]];
+                if (s->action == 0) {
+                    srm_buf_putf(&path, "riempi %dL → (%d,%d,%d)",
+                                 s->from == 0 ? 12 : (s->from == 1 ? 7 : 5),
+                                 s->a12, s->a7, s->a5);
+                } else if (s->action == 1) {
+                    srm_buf_putf(&path, "svuota %dL → (%d,%d,%d)",
+                                 s->from == 0 ? 12 : (s->from == 1 ? 7 : 5),
+                                 s->a12, s->a7, s->a5);
+                } else if (s->action == 2) {
+                    int cap_from = s->from == 0 ? 12 : (s->from == 1 ? 7 : 5);
+                    int cap_to   = s->to   == 0 ? 12 : (s->to   == 1 ? 7 : 5);
+                    srm_buf_putf(&path, "versa %dL→%dL → (%d,%d,%d)",
+                                 cap_from, cap_to, s->a12, s->a7, s->a5);
+                }
+                if (i > 0) srm_buf_puts(&path, "\n");
+            }
+            char *result = xstrdup(path.buf ? path.buf : "");
+            srm_buf_free(&path);
+            free(queue);
+            free(visited);
+            return result;
+        }
+
+        /* Generate next states (max 6 actions) */
+
+#define GEN_FILL(j, new_a12, new_a7, new_a5) do { \
+    int h = WJ_HASH(new_a12, new_a7, new_a5); \
+    if (!visited[h] && tail < max_states) { \
+        visited[h] = true; \
+        queue[tail++] = (wj_state){new_a12, new_a7, new_a5, head-1, 0, j, -1}; \
+    } \
+} while(0)
+
+#define GEN_EMPTY(j, new_a12, new_a7, new_a5) do { \
+    int h = WJ_HASH(new_a12, new_a7, new_a5); \
+    if (!visited[h] && tail < max_states) { \
+        visited[h] = true; \
+        queue[tail++] = (wj_state){new_a12, new_a7, new_a5, head-1, 1, j, -1}; \
+    } \
+} while(0)
+
+#define GEN_POUR(j, k, new_a12, new_a7, new_a5) do { \
+    int h = WJ_HASH(new_a12, new_a7, new_a5); \
+    if (!visited[h] && tail < max_states) { \
+        visited[h] = true; \
+        queue[tail++] = (wj_state){new_a12, new_a7, new_a5, head-1, 2, j, k}; \
+    } \
+} while(0)
+
+        /* Fill actions */
+        if (a12 < 12) GEN_FILL(0, 12, a7, a5);
+        if (a7  <  7) GEN_FILL(1, a12, 7, a5);
+        if (a5  <  5) GEN_FILL(2, a12, a7, 5);
+
+        /* Empty actions */
+        if (a12 > 0) GEN_EMPTY(0, 0, a7, a5);
+        if (a7  > 0) GEN_EMPTY(1, a12, 0, a5);
+        if (a5  > 0) GEN_EMPTY(2, a12, a7, 0);
+
+        /* Pour actions: from j to k */
+        /* Pour 12 → 7 */
+        if (a12 > 0 && a7 < 7) {
+            int space = 7 - a7;
+            int pour = (a12 < space) ? a12 : space;
+            GEN_POUR(0, 1, a12 - pour, a7 + pour, a5);
+        }
+        /* Pour 12 → 5 */
+        if (a12 > 0 && a5 < 5) {
+            int space = 5 - a5;
+            int pour = (a12 < space) ? a12 : space;
+            GEN_POUR(0, 2, a12 - pour, a7, a5 + pour);
+        }
+        /* Pour 7 → 12 */
+        if (a7 > 0 && a12 < 12) {
+            int space = 12 - a12;
+            int pour = (a7 < space) ? a7 : space;
+            GEN_POUR(1, 0, a12 + pour, a7 - pour, a5);
+        }
+        /* Pour 7 → 5 */
+        if (a7 > 0 && a5 < 5) {
+            int space = 5 - a5;
+            int pour = (a7 < space) ? a7 : space;
+            GEN_POUR(1, 2, a12, a7 - pour, a5 + pour);
+        }
+        /* Pour 5 → 12 */
+        if (a5 > 0 && a12 < 12) {
+            int space = 12 - a12;
+            int pour = (a5 < space) ? a5 : space;
+            GEN_POUR(2, 0, a12 + pour, a7, a5 - pour);
+        }
+        /* Pour 5 → 7 */
+        if (a5 > 0 && a7 < 7) {
+            int space = 7 - a7;
+            int pour = (a5 < space) ? a5 : space;
+            GEN_POUR(2, 1, a12, a7 + pour, a5 - pour);
+        }
+
+#undef GEN_POUR
+#undef GEN_EMPTY
+#undef GEN_FILL
+    }
+
+    free(queue);
+    free(visited);
+    return NULL;
+}
+
+#undef WJ_MAX_HASH
+#undef WJ_HASH
+
 static void print_help(void) {
     printf("ds4-srm — Symbolic Reasoning Module (standalone tool)\n");
     printf("Usage: ds4-srm [options]\n");
@@ -1316,6 +1973,8 @@ static void print_help(void) {
     printf("  --prove <text>      Prove a goal with backward chaining\n");
     printf("  --solve <text>      Solve constraints (e.g. \"A+B=10, A>B\")\n");
     printf("  --eval <text>       Evaluate logical expression\n");
+    printf("  --water <goal>      Water jug problem: reach goal amount in 12L jug\n");
+    printf("                      e.g. \"--water 6\" to get 6L in 12L jug\n");
     printf("  --save <path>       Save KB to file\n");
     printf("  --load <path>       Load KB from file\n");
     printf("  --clear             Reset KB\n");
@@ -1354,7 +2013,8 @@ int main(int argc, char **argv) {
 
     /* Collect actions to perform */
     typedef struct {
-        enum { ACT_ASSERT, ACT_QUERY, ACT_PROVE, ACT_SOLVE, ACT_EVAL, ACT_SAVE, ACT_LOAD, ACT_CLEAR } type;
+        enum { ACT_ASSERT, ACT_QUERY, ACT_PROVE, ACT_SOLVE, ACT_EVAL, ACT_WATER,
+               ACT_SAVE, ACT_LOAD, ACT_CLEAR } type;
         char *text;
     } action;
     action actions[32];
@@ -1400,6 +2060,11 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(argv[i], "--eval") && i+1 < argc) {
             action a = { .type = ACT_EVAL, .text = xstrdup(argv[++i]) };
+            actions[nactions++] = a;
+            continue;
+        }
+        if (!strcmp(argv[i], "--water") && i+1 < argc) {
+            action a = { .type = ACT_WATER, .text = xstrdup(argv[++i]) };
             actions[nactions++] = a;
             continue;
         }
@@ -1543,7 +2208,7 @@ int main(int argc, char **argv) {
                 if (json_mode) {
                     srm_buf jout;
                     srm_buf_init(&jout);
-                    void srm_buf_putf(&jout, "%s\n%s", pv.success ? "PROVATO" : "NON PROVATO",
+                    srm_buf_putf(&jout, "%s\n%s", pv.success ? "PROVATO" : "NON PROVATO",
                                  pv.trace.buf);
                     json_result(&output, true, jout.buf);
                     srm_buf_free(&jout);
@@ -1573,24 +2238,44 @@ int main(int argc, char **argv) {
             const char *text = a->text;
             srm_csp csp;
             srm_csp_init(&csp);
-            const char *ops[32], *lefts[32], *rights[32];
+            const char *ops[32], *lefts[32], *rights[32], *results[32];
             int rhss[32], nops = 0;
+            for (int ri = 0; ri < 32; ri++) results[ri] = NULL;
 
-            /* Split text by commas or newlines and process each part */
+            /* Split text by commas (respecting parentheses) and process each part */
             char buf[4096];
             strncpy(buf, text, sizeof(buf)-1);
             buf[sizeof(buf)-1] = '\0';
-            char *save = NULL;
-            char *part = strtok_r(buf, ",", &save);
-            while (part) {
-                while (*part && isspace(*part)) part++;
-                if (*part) srm_csp_add_constraint(&csp, part, ops, lefts, rights, rhss, &nops, 32);
-                part = strtok_r(NULL, ",", &save);
+            /* Custom split: track paren depth to avoid splitting inside parens */
+            const char *p = buf;
+            const char *start = buf;
+            int depth = 0;
+            while (*p) {
+                if (*p == '(' || *p == '[') depth++;
+                else if (*p == ')' || *p == ']') depth--;
+                else if (*p == ',' && depth == 0) {
+                    /* Process part from start to p */
+                    while (*start && isspace(*start)) start++;
+                    if (*start) {
+                        /* Temporarily null-terminate */
+                        char saved = *p;
+                        *(char*)p = '\0';
+                        srm_csp_add_constraint(&csp, start, ops, lefts, rights, results, rhss, &nops, 32);
+                        *(char*)p = saved;
+                    }
+                    start = p + 1;
+                }
+                p++;
+            }
+            /* Last part */
+            while (*start && isspace(*start)) start++;
+            if (*start) {
+                srm_csp_add_constraint(&csp, start, ops, lefts, rights, results, rhss, &nops, 32);
             }
 
             srm_buf solutions;
             srm_buf_init(&solutions);
-            bool found = srm_csp_solve(&csp, 0, ops, lefts, rights, rhss, nops, &solutions, 10);
+            bool found = srm_csp_solve(&csp, 0, ops, lefts, rights, results, rhss, nops, &solutions, 10);
 
             if (json_mode) {
                 json_result(&output, found, solutions.buf ? solutions.buf : "nessuna soluzione");
@@ -1606,9 +2291,38 @@ int main(int argc, char **argv) {
         }
 
         if (a->type == ACT_EVAL) {
-            /* Simple evaluation: check if the expression is valid */
+            /* Evaluate arithmetic expressions or logical queries */
             const char *text = a->text;
-            /* For now: just parse as query and check if it's provable */
+            
+            /* First try: simple integer arithmetic */
+            int a_val = 0, b_val = 0;
+            char op_str[8] = {0};
+            int parsed = sscanf(text, "%d %7s %d", &a_val, op_str, &b_val);
+            if (parsed == 3 && (op_str[0] == '+' || op_str[0] == '-' || 
+                op_str[0] == '*' || op_str[0] == '/')) {
+                int result = 0;
+                if (op_str[0] == '+') result = a_val + b_val;
+                else if (op_str[0] == '-') result = a_val - b_val;
+                else if (op_str[0] == '*') result = a_val * b_val;
+                else if (op_str[0] == '/') {
+                    if (b_val == 0) { 
+                        if (json_mode) json_result(&output, false, "division by zero");
+                        else printf("division by zero\n");
+                        continue;
+                    }
+                    result = a_val / b_val;
+                }
+                if (json_mode) {
+                    char res[32];
+                    snprintf(res, sizeof(res), "%d", result);
+                    json_result(&output, true, res);
+                } else {
+                    printf("%d\n", result);
+                }
+                continue;
+            }
+            
+            /* Second: parse as query and check if provable */
             srm_literal fact, query;
             srm_rule rule;
             char err[256];
@@ -1621,9 +2335,43 @@ int main(int argc, char **argv) {
                     printf("%s\n", pv.success ? "valido" : "non valido");
                 }
                 srm_proof_free(&pv);
+            } else if (type == 0 && fact.predicate) {
+                /* Check if fact exists */
+                bool found = false;
+                for (int fi = 0; fi < kb.nfacts; fi++) {
+                    srm_subst s;
+                    srm_subst_init(&s);
+                    if (srm_unify_literals(&fact, &kb.facts[fi], &s)) {
+                        found = true;
+                        srm_subst_free(&s);
+                        break;
+                    }
+                    srm_subst_free(&s);
+                }
+                if (json_mode) json_result(&output, found, found ? "true" : "false");
+                else printf("%s\n", found ? "true" : "false");
             } else {
                 if (json_mode) json_result(&output, false, "parse error");
                 else printf("Eval parse error\n");
+            }
+            continue;
+        }
+
+        if (a->type == ACT_WATER) {
+            int goal = atoi(a->text);
+            if (goal < 0 || goal > 12) {
+                if (json_mode) json_result(&output, false, "goal must be 0-12");
+                else printf("Goal must be between 0 and 12\n");
+                continue;
+            }
+            char *path = srm_water_jug(goal, 10000);
+            if (path) {
+                if (json_mode) json_result(&output, true, path);
+                else printf("Soluzione trovata:\n%s\n", path);
+                free(path);
+            } else {
+                if (json_mode) json_result(&output, false, "nessuna soluzione");
+                else printf("Nessuna soluzione trovata\n");
             }
             continue;
         }

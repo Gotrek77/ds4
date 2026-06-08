@@ -8,7 +8,6 @@
  *   cc -O2 -I. ds4_agent.c srm_tool.c -o ds4-agent -lm
  */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,8 +128,28 @@ char *srm_tool_exec(const char *action, const char *statement) {
         srm_literal fact = {0}, query = {0};
         srm_rule rule = {0};
         char err[256] = {0};
+        
+        /* Try parsing as query (? pred(...)) first */
         int type = srm_parse_line(statement, &fact, &rule, &query, err, sizeof(err));
-        if (type == 2 && query.predicate) {
+        
+        /* If parse as query failed, check if statement has variables (uppercase) */
+        if ((type != 2 || !query.predicate) && type != -1) {
+            /* Auto-detect: if statement contains uppercase letters (variables),
+             * treat it as a query even without ? prefix */
+            bool has_var = false;
+            for (const char *p = statement; *p; p++) {
+                if (isupper((unsigned char)*p)) { has_var = true; break; }
+            }
+            if (has_var && fact.predicate) {
+                /* Treat fact-as-literal as query with variables */
+                srm_query_result qr = srm_answer_query(&srm_kb_global, &fact);
+                json_result(&out, qr.success, qr.success ? qr.result_text.buf : "not proven");
+                srm_query_result_free(&qr);
+            } else {
+                json_result(&out, false, err[0] ? err : "parse error");
+            }
+        } else if (type == 2 && query.predicate) {
+            /* Proper query syntax: ? pred(...) */
             srm_query_result qr = srm_answer_query(&srm_kb_global, &query);
             json_result(&out, qr.success, qr.success ? qr.result_text.buf : "not proven");
             srm_literal_free(&query);
@@ -175,7 +194,37 @@ char *srm_tool_exec(const char *action, const char *statement) {
     }
 
     if (!strcmp(action, "eval")) {
-        /* Evaluate a literal: check if it's a fact or provable */
+        /* Evaluate arithmetic expressions (e.g. "2 + 3") or logical queries */
+        
+        /* First try: simple integer arithmetic (e.g., "2 + 3", "10 - 4", "3 * 5", "12 / 4") */
+        char buf[256];
+        strncpy(buf, statement, sizeof(buf)-1);
+        buf[sizeof(buf)-1] = '\0';
+        
+        /* Check for arithmetic pattern: "num op num" */
+        int a_val = 0, b_val = 0;
+        char op_str[8] = {0};
+        int parsed = sscanf(buf, "%d %7s %d", &a_val, op_str, &b_val);
+        if (parsed == 3 && (op_str[0] == '+' || op_str[0] == '-' || 
+            op_str[0] == '*' || op_str[0] == '/')) {
+            int result = 0;
+            if (op_str[0] == '+') result = a_val + b_val;
+            else if (op_str[0] == '-') result = a_val - b_val;
+            else if (op_str[0] == '*') result = a_val * b_val;
+            else if (op_str[0] == '/') {
+                if (b_val == 0) {
+                    json_result(&out, false, "division by zero");
+                    return srm_buf_take(&out);
+                }
+                result = a_val / b_val;
+            }
+            char res[32];
+            snprintf(res, sizeof(res), "%d", result);
+            json_result(&out, true, res);
+            return srm_buf_take(&out);
+        }
+        
+        /* Second: evaluate a literal — check if it's a fact or provable */
         srm_literal fact = {0}, lit = {0};
         srm_rule rule = {0};
         char err[256] = {0};
@@ -191,6 +240,12 @@ char *srm_tool_exec(const char *action, const char *statement) {
             }
             json_result(&out, found, found ? "true" : "false");
             srm_literal_free(&fact);
+        } else if (type == 2 && lit.predicate) {
+            /* Query-style eval: check if provable */
+            srm_proof pv = srm_prove(&srm_kb_global, &lit, 20);
+            json_result(&out, pv.success, pv.success ? "valido" : "non valido");
+            srm_literal_free(&lit);
+            srm_proof_free(&pv);
         } else {
             json_result(&out, false, err[0] ? err : "parse error");
         }
@@ -214,6 +269,74 @@ char *srm_tool_exec(const char *action, const char *statement) {
         snprintf(msg, sizeof(msg), "loaded %d facts, %d rules from %s",
                  srm_kb_global.nfacts, srm_kb_global.nrules, statement);
         json_result(&out, true, msg);
+        return srm_buf_take(&out);
+    }
+
+    if (!strcmp(action, "csp")) {
+        /* Solve constraint satisfaction problem */
+        srm_csp csp;
+        srm_csp_init(&csp);
+        const char *ops[32], *lefts[32], *rights[32], *results[32];
+        int rhss[32], nops = 0;
+        for (int ri = 0; ri < 32; ri++) results[ri] = NULL;
+
+        /* Split by commas respecting parentheses */
+        char buf[4096];
+        strncpy(buf, statement, sizeof(buf)-1);
+        buf[sizeof(buf)-1] = '\0';
+        const char *p = buf;
+        const char *start = buf;
+        int depth = 0;
+        while (*p) {
+            if (*p == '(' || *p == '[') depth++;
+            else if (*p == ')' || *p == ']') depth--;
+            else if (*p == ',' && depth == 0) {
+                while (*start && isspace(*start)) start++;
+                if (*start) {
+                    char saved = *p;
+                    *(char*)p = '\0';
+                    srm_csp_add_constraint(&csp, start, ops, lefts, rights, results, rhss, &nops, 32);
+                    *(char*)p = saved;
+                }
+                start = p + 1;
+            }
+            p++;
+        }
+        while (*start && isspace(*start)) start++;
+        if (*start) {
+            srm_csp_add_constraint(&csp, start, ops, lefts, rights, results, rhss, &nops, 32);
+        }
+
+        srm_buf solutions;
+        srm_buf_init(&solutions);
+        bool found = srm_csp_solve(&csp, 0, ops, lefts, rights, results, rhss, nops, &solutions, 10);
+        if (found) {
+            json_result(&out, true, solutions.buf ? solutions.buf : "");
+        } else {
+            json_result(&out, false, "nessuna soluzione");
+        }
+        srm_buf_free(&solutions);
+        for (int i = 0; i < nops; i++) {
+            free((void*)ops[i]); free((void*)lefts[i]); free((void*)rights[i]);
+            if (results[i]) free((void*)results[i]);
+        }
+        return srm_buf_take(&out);
+    }
+
+    if (!strcmp(action, "water")) {
+        /* Solve water jug problem: goal amount in 12L jug */
+        int goal = atoi(statement);
+        if (goal < 0 || goal > 12) {
+            json_result(&out, false, "goal must be 0-12");
+            return srm_buf_take(&out);
+        }
+        char *path = srm_water_jug(goal, 10000);
+        if (path) {
+            json_result(&out, true, path);
+            free(path);
+        } else {
+            json_result(&out, false, "nessuna soluzione");
+        }
         return srm_buf_take(&out);
     }
 

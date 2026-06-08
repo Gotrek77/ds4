@@ -356,14 +356,15 @@ static void test_csp_simple(void) {
     srm_csp_add_var(&csp, "A", 1, 9);
     srm_csp_add_var(&csp, "B", 1, 9);
 
-    const char *ops[10], *lefts[10], *rights[10];
+    const char *ops[10], *lefts[10], *rights[10], *results[10];
     int rhss[10], nops = 0;
-    ops[nops] = "="; lefts[nops] = "A"; rights[nops] = "B"; rhss[nops] = 10; nops++;
-    ops[nops] = ">"; lefts[nops] = "A"; rights[nops] = "B"; rhss[nops] = 0; nops++;
+    for (int ri = 0; ri < 10; ri++) results[ri] = NULL;
+    ops[nops] = "+"; lefts[nops] = "A"; rights[nops] = "B"; results[nops] = NULL; rhss[nops] = 10; nops++;
+    ops[nops] = ">"; lefts[nops] = "A"; rights[nops] = "B"; results[nops] = NULL; rhss[nops] = 0; nops++;
 
     srm_buf solutions;
     srm_buf_init(&solutions);
-    bool found = srm_csp_solve(&csp, 0, ops, lefts, rights, rhss, nops, &solutions, 5);
+    bool found = srm_csp_solve(&csp, 0, ops, lefts, rights, results, rhss, nops, &solutions, 5);
     TEST("csp found solutions", found);
     TEST("csp solutions non-empty", solutions.len > 0);
     srm_buf_free(&solutions);
