@@ -3,6 +3,7 @@
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
+#include "lobster_tool.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -930,6 +931,24 @@ static const char agent_tools_prompt_after_edit[] =
     "        \"path\": {\"type\": \"string\"}\n"
     "      },\n"
     "      \"required\": [\"path\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"lobster\",\n"
+    "    \"description\": \"Run a DataLog reasoning program using Lobster (a Scallop fork). \"\n"
+    "    \"Given facts and rules, returns derived relation tuples. \"\n"
+    "    \"Supports unit, minmaxprob, difftopkproofs provenances.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"program\": {\"type\": \"string\", \"description\": \"DataLog source code with facts, rules, and optional query\"},\n"
+    "        \"provenance\": {\"type\": \"string\", \"description\": \"Provenance semiring: unit (default), bool, proofs, tropical, minmaxprob, topkproofs, etc.\"},\n"
+    "        \"query\": {\"type\": \"string\", \"description\": \"Optional relation name to query; if omitted all relations are output\"}\n"
+    "      },\n"
+    "      \"required\": [\"program\"]\n"
     "    }\n"
     "  }\n"
     "}\n"
@@ -2773,6 +2792,7 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "search")) return "search ";
     if (!strcmp(name, "google_search")) return "google ";
     if (!strcmp(name, "visit_page")) return "visit ";
+    if (!strcmp(name, "lobster")) return "lobster ";
     return NULL;
 }
 
@@ -3572,6 +3592,20 @@ static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
 
 static void agent_buf_puts(agent_buf *b, const char *s) {
     agent_buf_append(b, s, strlen(s));
+}
+
+static void agent_buf_printf(agent_buf *b, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    char *buf = xmalloc((size_t)n + 1);
+    va_start(ap, fmt);
+    vsnprintf(buf, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    agent_buf_append(b, buf, (size_t)n);
+    free(buf);
 }
 
 static char *agent_buf_take(agent_buf *b) {
@@ -7183,10 +7217,35 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
             return xstrdup(msg);
         }
         int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
-                                              60, 1, 3600);
+                                               60, 1, 3600);
         bool stop = !strcmp(call->name, "bash_stop");
         bool wait = stop;
         return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
+    }
+
+    if (!strcmp(call->name, "lobster")) {
+        const char *program = agent_tool_arg_value(call, "program");
+        const char *query = agent_tool_arg_value(call, "query");
+        if (!program || !program[0]) return xstrdup("Tool error: lobster requires program\n");
+        /* Build a full DataLog source with optional query */
+        agent_buf src = {0};
+        agent_buf_puts(&src, program);
+        if (query && query[0]) {
+            agent_buf_printf(&src, "\nquery %s\n", query);
+        }
+        char err[256] = {0};
+        char *result = lobster_tool_exec(agent_buf_take(&src), err, sizeof(err));
+        if (!result) {
+            agent_buf eb = {0};
+            agent_buf_puts(&eb, "Tool error: lobster failed: ");
+            agent_buf_puts(&eb, err[0] ? err : "unknown error");
+            agent_buf_puts(&eb, "\n");
+            return agent_buf_take(&eb);
+        }
+        agent_buf out = {0};
+        agent_buf_printf(&out, "Lobster result:\n%s\n", result);
+        free(result);
+        return agent_buf_take(&out);
     }
 
     {
