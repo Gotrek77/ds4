@@ -16,3 +16,16 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+
+# SRM / test binaries
+/ds4-srm
+/ds4-srm-asan
+/ds4-srm-dbg
+/ds4-srm-test
+/ds4-srm-test-asan
+/ds4-srm-test-asan0
+/ds4-srm-test-dbg
+/ds4-srm.c.bak
+/ds4-agent-asan
+/scli
+/test_lobster

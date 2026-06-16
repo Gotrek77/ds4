@@ -1,0 +1,46 @@
+// Water jug problem: 3 bottles 12L, 7L, 5L. Initial 12 full.
+// Goal: any bottle contains 1 liter.
+
+type state(i32, i32, i32)
+type pour(i32, i32, i32, i32, i32)
+
+rel cap(0, 12)
+rel cap(1, 7)
+rel cap(2, 5)
+
+// Initial state: bottle0=12, bottle1=0, bottle2=0
+rel state(12, 0, 0)
+
+// Pour from i to j when src > 0 and dst < cap[j]
+// Two cases: src <= cap[j]-dst => pour = src, else pour = cap[j]-dst
+
+// Case 1: src <= cap[j]-dst  => pour = src
+rel pour(0, 1, A, B, A) :- state(A,B,C), A>0, B<7, A <= 7-B
+rel pour(0, 2, A, C, A) :- state(A,B,C), A>0, C<5, A <= 5-C
+rel pour(1, 0, B, A, B) :- state(A,B,C), B>0, A<12, B <= 12-A
+rel pour(1, 2, B, C, B) :- state(A,B,C), B>0, C<5, B <= 5-C
+rel pour(2, 0, C, A, C) :- state(A,B,C), C>0, A<12, C <= 12-A
+rel pour(2, 1, C, B, C) :- state(A,B,C), C>0, B<7, C <= 7-B
+
+// Case 2: src > cap[j]-dst => pour = cap[j]-dst
+rel pour(0, 1, A, B, 7-B) :- state(A,B,C), A>0, B<7, A > 7-B
+rel pour(0, 2, A, C, 5-C) :- state(A,B,C), A>0, C<5, A > 5-C
+rel pour(1, 0, B, A, 12-A) :- state(A,B,C), B>0, A<12, B > 12-A
+rel pour(1, 2, B, C, 5-C) :- state(A,B,C), B>0, C<5, B > 5-C
+rel pour(2, 0, C, A, 12-A) :- state(A,B,C), C>0, A<12, C > 12-A
+rel pour(2, 1, C, B, 7-B) :- state(A,B,C), C>0, B<7, C > 7-B
+
+// New state after pour
+rel state(A-P, B+P, C) :- pour(0,1,A,B,P), state(A,B,C)   // 12->7
+rel state(A-P, B, C+P) :- pour(0,2,A,C,P), state(A,B,C)   // 12->5
+rel state(A, B-P, C+P) :- pour(1,2,B,C,P), state(A,B,C)   // 7->5
+rel state(A+P, B-P, C) :- pour(1,0,B,A,P), state(A,B,C)   // 7->12
+rel state(A+P, B, C-P) :- pour(2,0,C,A,P), state(A,B,C)   // 5->12
+rel state(A, B+P, C-P) :- pour(2,1,C,B,P), state(A,B,C)   // 5->7
+
+// Goal: any bottle has 1 liter
+rel goal() :- state(1,_,_)
+rel goal() :- state(_,1,_)
+rel goal() :- state(_,_,1)
+
+query goal

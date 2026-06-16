@@ -1,0 +1,57 @@
+% Water jug problem: 3 bottles (12,7,5). Initial (12,0,0). Find states where one bottle is 1.
+
+% Define capacities
+cap(0,12). cap(1,7). cap(2,5).
+
+% Initial state
+state(12,0,0).
+
+% Transition: pour from i to j
+state(A,B,C) :- state(A,B,C).  % identity (for closure)
+% We need to generate all possible pours.
+% For each source i and dest j, if source >0 and dest < cap[j], pour min(source, cap[j]-dest).
+% But Datalog can't do arithmetic directly in this simple form. We need to encode all possible moves explicitly.
+% However we can use a rule that iterates over all possible amounts.
+% Better: use a rule with arithmetic via "between" or "range".
+% We can use "sum" or "diff" with explicit numbers.
+% Since the state space is small (13*8*6=624), we can enumerate all possible states and transitions.
+% Let's define a relation move(i,j,src,dst,new_src,new_dst) that represents pouring.
+% But we need arithmetic to compute new amounts.
+% We can define a relation pour(i,j,from,to,new_from,new_to) using explicit enumeration.
+% Alternatively, we can use "choice" or "aggregate". Simpler: use a Python-like approach? 
+% Actually Scallop supports arithmetic via "let" or "assign". 
+% We can write: 
+%   state(N12,N7,N5) :- state(S12,S7,S5), S12>0, N7<7, let N12 = S12 - min(S12,7-S7), let N7 = S7 + min(S12,7-S7), ...
+% But Scallop might not support let bindings.
+% Let's check Scallop's syntax: it supports "let" in rules? Not sure.
+% Safer: use a procedural approach with all possible pour amounts precomputed.
+% Since capacities are small, we can enumerate all possible pour amounts (1..12).
+% We can define a relation "pour" that gives for each source bottle and dest bottle the possible pour amounts.
+% Actually we can define:
+%   pour(i,j,src,dst,new_src,new_dst) where src > 0 and dst < cap[j] and new_src = src - min(src, cap[j]-dst) etc.
+% But we need arithmetic.
+
+% Let's use a simpler approach: just list all possible states as facts? That would require 624 states, too many.
+% Instead, we can use a rule with "sum" and "min" using Scallop's built-in arithmetic.
+% Scallop supports arithmetic expressions in rules using "let" or directly.
+% Let's write a rule that uses "let" bindings.
+
+% Actually Scallop supports "let" in the body? Let's check documentation. The scli --help shows provenance options.
+% Let's just try a program with let bindings.
+
+% Define:
+%   new_state(A,B,C) :- state(A,B,C).  % identity
+%   new_state(A2,B2,C2) :- state(A,B,C), 
+%     let src12 = A, src7 = B, src5 = C,
+%     % pour 12->7
+%     src12 > 0, B < 7,
+%     let pour = min(src12, 7 - B),
+%     let A2 = src12 - pour, let B2 = B + pour, let C2 = src5,
+%     A2 >= 0, B2 <= 7, C2 >= 0.
+% But Scallop might not support let with multiple assignments.
+
+% Let's search for Scallop documentation. We can visit the scallop repo's readme.</think>
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="read">
+<｜DSML｜parameter name="path" string="true">/home/vulkano/work/scallop/readme.md
