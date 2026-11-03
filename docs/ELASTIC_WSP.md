@@ -213,3 +213,15 @@ weights shared by all 43 layers. It checks, bit-exactly:
   identical logits;
 - session sync/eval with loops, the elastic policy, and a concept step
   followed by a token step.
+
+## Finding schedules the model tolerates
+
+A stock model was not trained to loop, so every block and depth needs
+measuring. `tests/elastic_sweep.sh MODEL.gguf` runs each schedule twice. The
+first run computes perplexity of a fixed text, teacher-forced through the
+loops. The second runs free greedy generation and records whether the answer
+ends (`eos`) and how much it repeats (`distinct2`). Results land in
+`elastic-sweep/summary.txt`, ranked against stock. Perplexity alone misses
+the typical failure: an answer that starts well and never stops. That is why
+the second run checks free generation. Rerunning the script skips schedules
+already in `elastic-sweep/results.csv`.

@@ -3,6 +3,7 @@
 
     python3 tests/compare_logprobs.py A.json B.json
     python3 tests/compare_logprobs.py --text A.json    # print the continuation
+    python3 tests/compare_logprobs.py --stats A.json   # eos step and distinct-2
 
 Reports how many greedy steps agree on the selected token, and the largest
 logprob difference over the tokens both runs list in their top-k.  Exit code
@@ -28,9 +29,29 @@ def text(path):
     return raw.decode("utf-8", errors="replace")
 
 
+def stats(path):
+    """Free-generation health: the step that ends the answer (-1: never) and
+    the fraction of distinct token bigrams (low means looping text)."""
+    steps = load(path)
+    ids = [tid(s["selected"]) for s in steps]
+    eos = -1
+    for i, s in enumerate(steps):
+        if "end" in s["selected"].get("text", "") and "sentence" in s["selected"].get("text", ""):
+            eos = i
+            break
+    body = ids[:eos] if eos >= 0 else ids
+    pairs = list(zip(body, body[1:]))
+    distinct2 = len(set(pairs)) / len(pairs) if pairs else 1.0
+    return eos, distinct2
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--text":
         print(text(sys.argv[2]))
+        return 0
+    if len(sys.argv) == 3 and sys.argv[1] == "--stats":
+        eos, d2 = stats(sys.argv[2])
+        print(f"{eos} {d2:.3f}")
         return 0
     if len(sys.argv) != 3:
         print(__doc__)
