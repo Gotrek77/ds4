@@ -39,10 +39,13 @@ mkdir -p "$OUT"
 CSV=$OUT/results.csv
 [ -f "$CSV" ] || echo "block,loops,layer_passes,ppl,eos,distinct2,seconds" > "$CSV"
 
-measure() {  # name loopflags...
-    name=$1; shift
-    if grep -q "^$name," "$CSV"; then echo "== $name (cached)"; return; fi
-    printf '== %-12s ' "$name"
+measure() {  # block loopflags...
+    block=$1; shift
+    # A schedule is its block and loop count; rows already measured are kept.
+    if grep -q "^$block,$LOOPS_NOW," "$CSV"; then echo "== $block x$LOOPS_NOW (cached)"; return; fi
+    name="$block-x$LOOPS_NOW"
+    name=$(echo "$name" | tr ':' '_')
+    printf '== %-14s ' "$block x$LOOPS_NOW"
     t0=$(date +%s)
     # shellcheck disable=SC2086
     ppl=$(./ds4 -m "$MODEL" $BACKEND --ctx 4096 -n "$TOKENS" \
@@ -55,7 +58,7 @@ measure() {  # name loopflags...
     t1=$(date +%s)
     eos=${gen% *}; d2=${gen#* }
     echo "ppl=${ppl:-FAILED} eos=$eos distinct2=$d2 ($((t1 - t0))s)"
-    echo "$name,$LOOPS_NOW,$PASSES,${ppl:-},$eos,$d2,$((t1 - t0))" >> "$CSV"
+    echo "$block,$LOOPS_NOW,$PASSES,${ppl:-},$eos,$d2,$((t1 - t0))" >> "$CSV"
 }
 
 LOOPS_NOW=1; PASSES=$N_LAYER
