@@ -118,7 +118,7 @@ class MemSampler(threading.Thread):
         self.rss_peak_mb = 0.0
         self.rss_start_mb = None
         self.gpu_peak_mb = None
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self._gpu_ok = shutil.which("nvidia-smi") is not None
 
     def _rss_mb(self):
@@ -150,7 +150,7 @@ class MemSampler(threading.Thread):
 
     def run(self):
         tick = 0
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             rss = self._rss_mb()
             if rss is not None:
                 if self.rss_start_mb is None:
@@ -161,10 +161,10 @@ class MemSampler(threading.Thread):
                 if gpu is not None:
                     self.gpu_peak_mb = max(self.gpu_peak_mb or 0.0, gpu)
             tick += 1
-            self._stop.wait(self.period)
+            self._halt.wait(self.period)
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         self.join(timeout=5)
 
 

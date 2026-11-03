@@ -76,6 +76,15 @@ def main():
     assert abs(mem["kv_mb"] - 798.72) < 0.01 and mem["ctx"] == 32768 and mem["raw_rows"] == 4352
     assert abs(solpi.kv_live_mb(mem, 4352) - (mem["raw_mb"] + mem["comp_mb"] * 4352 / 32768)) < 1e-6
 
+    # The sampler must start, sample a real process and stop cleanly.
+    sampler = solpi.MemSampler(os.getpid(), period=0.01)
+    sampler.start()
+    import time
+    time.sleep(0.1)
+    sampler.stop()
+    sampler.stop()   # idempotent: run_mode stops it again in its finally block
+    assert sampler.rss_peak_mb > 0 and sampler.rss_start_mb > 0 and not sampler.is_alive()
+
     results = {}
     for mode in ("baseline", "solpi"):
         Fake.last = ""
