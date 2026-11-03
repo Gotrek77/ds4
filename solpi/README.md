@@ -54,13 +54,13 @@ so no port needs publishing:
 ```bash
 M=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 sh docker/ds4-docker.sh make
-sh docker/ds4-docker.sh run python3 solpi/bench.py -m "$M" --server-args "--cuda" --repeat 3
+sh docker/ds4-docker.sh run python3 solpi/bench.py -m "$M" --repeat 3 -- --cuda
 ```
 
 Native build with a 24 GB GPU and SSD streaming:
 
 ```bash
-python3 solpi/bench.py -m "$M" --server-args "--cuda --ssd-streaming --ssd-streaming-cache-experts 1000"
+python3 solpi/bench.py -m "$M" -- --cuda --ssd-streaming --ssd-streaming-cache-experts 1000
 ```
 
 Offline self-test, with no model: `python3 solpi/test_solpi.py`.

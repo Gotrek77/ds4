@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Benchmark SoL-Pi mechanisms against a baseline agent on ds4-server.
 
-    python3 solpi/bench.py -m gguf/MODEL.gguf [--server-args "--cuda ..."]
+    python3 solpi/bench.py -m gguf/MODEL.gguf [options] -- --cuda [more ds4-server flags]
     python3 solpi/bench.py --url http://127.0.0.1:8000        # existing server
+
+Everything after `--` is passed to ds4-server.
 
 Each mode runs the same multi-step debugging task (a 3-bug project with a
 ~40 KB test log) for at most --turns model turns.  By default every mode gets
@@ -165,11 +167,12 @@ def report(results):
     print("Prefilled tokens are what ds4 actually computes: KV prefix reuse is nearly free locally.")
 
 
-def main():
+def parse_cli(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-m", "--model", help="GGUF model (starts its own ds4-server per mode)")
     ap.add_argument("--server", default="./ds4-server", help="ds4-server binary")
-    ap.add_argument("--server-args", default="", help="extra ds4-server flags, e.g. \"--cuda\"")
+    ap.add_argument("--server-args", default="",
+                    help="extra ds4-server flags; use --server-args=\"--cuda\" or put them after --")
     ap.add_argument("--ctx", type=int, default=32768)
     ap.add_argument("--url", help="use an already running server instead of starting one")
     ap.add_argument("--server-pid", type=int, help="with --url: PID to sample for memory")
@@ -178,9 +181,19 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=4096)
     ap.add_argument("--repeat", type=int, default=1, help="episodes per mode (median reported)")
     ap.add_argument("--out", default="solpi-results")
-    args = ap.parse_args()
+    server_tail = []
+    if "--" in argv:
+        cut = argv.index("--")
+        argv, server_tail = argv[:cut], argv[cut + 1:]
+    args = ap.parse_args(argv)
+    args.server_args = " ".join([args.server_args] + [shlex.quote(a) for a in server_tail]).strip()
     if not args.url and not args.model:
         ap.error("pass -m MODEL or --url URL")
+    return args
+
+
+def main():
+    args = parse_cli(sys.argv[1:])
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     outdir = os.path.abspath(os.path.join(args.out, stamp))
