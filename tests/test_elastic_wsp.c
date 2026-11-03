@@ -126,6 +126,33 @@ static void fake_session_free(ds4_session *s) {
     free(s);
 }
 
+/* The tape every backend walks: input block, recurrent block N times, output
+ * block, with LAST-mode provisional flags on all but the final loop. */
+static void test_loop_tape(void) {
+    assert(loop_tape_len(NULL) == DS4_N_LAYER);
+    ds4_loop_config cfg = {.rec_start = 2, .rec_end = 5, .num_loops = 3};
+    assert(loop_tape_len(&cfg) == DS4_N_LAYER + 6);
+    const uint32_t want_il[] = {0, 1, 2, 3, 4, 2, 3, 4, 2, 3, 4, 5, 6};
+    const uint32_t want_k[] = {0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 0, 0};
+    for (uint32_t step = 0; step < 13; step++) {
+        uint32_t k;
+        bool prov;
+        assert(loop_tape_layer(&cfg, step, &k, &prov) == want_il[step]);
+        assert(k == want_k[step]);
+        assert(prov == (step >= 2 && step < 8));
+    }
+    uint32_t last = loop_tape_layer(&cfg, loop_tape_len(&cfg) - 1, NULL, NULL);
+    assert(last == DS4_N_LAYER - 1);
+    cfg.kv_mode = DS4_LOOP_KV_PER_LOOP;
+    bool prov = true;
+    (void)loop_tape_layer(&cfg, 3, NULL, &prov);
+    assert(!prov);
+    cfg.num_loops = 1;      /* inactive: identity tape */
+    assert(loop_tape_len(&cfg) == DS4_N_LAYER);
+    for (uint32_t step = 0; step < DS4_N_LAYER; step++)
+        assert(loop_tape_layer(&cfg, step, NULL, &prov) == step && !prov);
+}
+
 static void test_loop_policy(void) {
     fake_engine.backend = DS4_BACKEND_CPU;
     char err[256];
@@ -466,6 +493,7 @@ static void test_mlc(void) {
 
 int main(void) {
     test_mark_rollback();
+    test_loop_tape();
     test_loop_policy();
     test_wsp_codecs();
     test_wsp_mapping();

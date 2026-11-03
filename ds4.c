@@ -15942,6 +15942,45 @@ static void forward_token_raw_swa_cpu_decode_scratch(
  * layer produces a KV row for the same position (see ds4_loop_kv_mode).
  */
 
+/* The decode tape: the sequence of layer passes for one position.  Every
+ * backend walks the same tape, so the schedule is defined once:
+ *
+ *     step:  0 .. a-1 | a .. a+N*(b-a)-1           | .. L+(N-1)*(b-a)-1
+ *     layer: 0 .. a-1 | a..b-1, a..b-1, ... N times | b .. L-1
+ *
+ * A pass is provisional when, in LAST mode, a later loop will run the same
+ * layer again for this position: its KV side effects must be undone. */
+static bool loop_config_active(const ds4_loop_config *cfg) {
+    return cfg && cfg->num_loops > 1 && cfg->rec_start < cfg->rec_end;
+}
+
+static uint32_t loop_tape_len(const ds4_loop_config *cfg) {
+    if (!loop_config_active(cfg)) return DS4_N_LAYER;
+    return DS4_N_LAYER + (cfg->num_loops - 1) * (cfg->rec_end - cfg->rec_start);
+}
+
+static uint32_t loop_tape_layer(const ds4_loop_config *cfg, uint32_t step,
+                                uint32_t *loop, bool *provisional) {
+    uint32_t il = step, k = 0;
+    if (loop_config_active(cfg) && step >= cfg->rec_start) {
+        const uint32_t a = cfg->rec_start, w = cfg->rec_end - cfg->rec_start;
+        const uint32_t rec_steps = cfg->num_loops * w;
+        if (step - a < rec_steps) {
+            k = (step - a) / w;
+            il = a + (step - a) % w;
+        } else {
+            il = step - (cfg->num_loops - 1) * w;
+        }
+    }
+    if (loop) *loop = k;
+    if (provisional) {
+        *provisional = loop_config_active(cfg) && cfg->kv_mode == DS4_LOOP_KV_LAST &&
+                       il >= cfg->rec_start && il < cfg->rec_end &&
+                       k + 1 < cfg->num_loops;
+    }
+    return il;
+}
+
 /* Everything one decode pass mutates in a layer cache.  A pass appends one
  * raw row (sliding the window when full), updates the compressor states, and
  * may append one compressed row.  Restoring the counters, the compressor
@@ -16042,7 +16081,7 @@ static void layer_cache_mark_free(ds4_layer_cache_mark *m) {
 }
 
 static bool loop_state_active(const ds4_loop_state *ls) {
-    return ls && ls->cfg.num_loops > 1 && ls->cfg.rec_start < ls->cfg.rec_end;
+    return ls && loop_config_active(&ls->cfg);
 }
 
 static uint32_t loop_state_rec_layers(const ds4_loop_state *ls) {
@@ -16134,11 +16173,7 @@ static void forward_token_looped_cpu(
         float               steering_attn_scale,
         float               steering_ffn_scale,
         ds4_cpu_decode_scratch * scratch) {
-    const bool looped = loop_state_active(ls);
-    const uint32_t a = looped ? ls->cfg.rec_start : 0;
-    const uint32_t b = looped ? ls->cfg.rec_end : 0;
-    const uint32_t n_loops = looped ? ls->cfg.num_loops : 1;
-    const bool last_only = looped && ls->cfg.kv_mode == DS4_LOOP_KV_LAST;
+    const ds4_loop_config *cfg = loop_state_active(ls) ? &ls->cfg : NULL;
     float *cur = scratch->cur;
     float *next = scratch->next;
 
@@ -16149,35 +16184,25 @@ static void forward_token_looped_cpu(
     }
     hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
 
-/* Run layer IL on cur against cache LC, then make its output the new cur. */
-#define LOOP_LAYER(IL, LC) do { \
-        layer_forward_raw_swa_one(next, model, &weights->layer[(IL)], (LC), \
-                                  cur, (IL), pos, token, steering_dirs, \
-                                  steering_attn_scale, steering_ffn_scale, \
-                                  scratch); \
-        float *tmp_ = cur; cur = next; next = tmp_; \
-    } while (0)
-
-    /* Input block. */
-    for (uint32_t il = 0; il < a; il++) LOOP_LAYER(il, &cache->layer[il]);
-
-    /* Recurrent block.  In LAST mode the provisional passes see their own
-     * row (attention over the current position is part of the layer) and
-     * then roll it back, so the cache ends up holding only the final pass,
-     * exactly the row layout of the stock model. */
-    for (uint32_t loop = 0; loop < n_loops && a < b; loop++) {
-        const bool provisional = last_only && loop + 1 < n_loops;
-        for (uint32_t il = a; il < b; il++) {
-            ds4_layer_cache *lc = loop_layer_cache(cache, ls, loop, il);
-            if (provisional) layer_cache_mark_save(&ls->mark, lc);
-            LOOP_LAYER(il, lc);
-            if (provisional) layer_cache_mark_restore(&ls->mark, lc);
-        }
+    /* Provisional passes see their own row (attention over the current
+     * position is part of the layer) and then roll it back, so in LAST mode
+     * the cache ends up holding only the final pass, exactly the row layout
+     * of the stock model. */
+    const uint32_t steps = loop_tape_len(cfg);
+    for (uint32_t step = 0; step < steps; step++) {
+        uint32_t loop;
+        bool provisional;
+        const uint32_t il = loop_tape_layer(cfg, step, &loop, &provisional);
+        ds4_layer_cache *lc = cfg ? loop_layer_cache(cache, ls, loop, il) : &cache->layer[il];
+        if (provisional) layer_cache_mark_save(&ls->mark, lc);
+        layer_forward_raw_swa_one(next, model, &weights->layer[il], lc, cur, il, pos, token,
+                                  steering_dirs, steering_attn_scale, steering_ffn_scale,
+                                  scratch);
+        if (provisional) layer_cache_mark_restore(&ls->mark, lc);
+        float *tmp = cur;
+        cur = next;
+        next = tmp;
     }
-
-    /* Output block: every layer when the schedule is not looped. */
-    for (uint32_t il = b; il < DS4_N_LAYER; il++) LOOP_LAYER(il, &cache->layer[il]);
-#undef LOOP_LAYER
 
     if (logits) {
         output_logits_one_decode_scratch(logits, model, weights, cur, scratch);
@@ -17785,6 +17810,18 @@ typedef struct {
     const ds4_gpu_tensor *hc_expand_residual;
     const ds4_gpu_tensor *hc_expand_post;
     const ds4_gpu_tensor *hc_expand_comb;
+
+    /* Elastic loops (LAST KV mode only on the graph): the decode tape, and
+     * one scratch copy of a layer's compressor frontier.  Provisional passes
+     * run one layer at a time, so a single scratch set, reused in stream
+     * order, covers every recurrent layer. */
+    ds4_loop_config loop;
+    ds4_gpu_tensor *loop_attn_state_kv;
+    ds4_gpu_tensor *loop_attn_state_score;
+    ds4_gpu_tensor *loop_index_state_kv;
+    ds4_gpu_tensor *loop_index_state_score;
+    uint32_t loop_mark_n_comp;
+    uint32_t loop_mark_n_index_comp;
 } ds4_gpu_graph;
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
@@ -18247,6 +18284,12 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     /* Captured decode-island graphs bake this graph's buffer addresses
      * into their kernel nodes; retire them before the buffers go away. */
     ds4_gpu_decode_graphs_invalidate();
+    ds4_gpu_tensor_free(g->loop_attn_state_kv);
+    ds4_gpu_tensor_free(g->loop_attn_state_score);
+    ds4_gpu_tensor_free(g->loop_index_state_kv);
+    ds4_gpu_tensor_free(g->loop_index_state_score);
+    g->loop_attn_state_kv = g->loop_attn_state_score = NULL;
+    g->loop_index_state_kv = g->loop_index_state_score = NULL;
     /* free every Class P slot across all DS4_MAX_GPUS tier
      * slots. Unallocated slots are NULL and ds4_gpu_tensor_free(NULL) is a
      * no-op. The hc_pre / hc_post / hc_comb views must be freed BEFORE
@@ -30341,6 +30384,98 @@ static bool metal_graph_dspark_capture_commit_prefix(
 
 /* Encode a full single-token decode step on Metal.  This is the generation
  * hot path: update caches, run all layers, then produce logits. */
+/* Elastic loops on the graph backends.
+ *
+ * A provisional pass (LAST mode) must leave no trace in the layer's KV state.
+ * On the graph that state is smaller than on the CPU:
+ *
+ * - raw rows live in a ring indexed by pos % raw_cap, so the final pass of
+ *   the same position rewrites exactly the row a provisional pass wrote;
+ * - compressed and indexer rows are appended at the host-side counters, so
+ *   restoring the counters makes the final pass rewrite the same rows (rows
+ *   past the counters are invisible, as for speculative rewind);
+ * - the compressor frontiers (state kv/score) are updated in place: these are
+ *   the only bytes to save and restore, a few hundred KB per layer.
+ *
+ * The copies are queued in stream order between the layer kernels, so no
+ * synchronization is needed.  Counters are host state consumed at encode
+ * time, so saving and restoring them while encoding is exact. */
+static bool metal_graph_loop_reserve(ds4_gpu_graph *g) {
+    uint64_t attn = 0, index = 0;
+    for (uint32_t il = g->loop.rec_start; il < g->loop.rec_end && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        if (ab > attn) attn = ab;
+        if (ratio == 4) {
+            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            if (ib > index) index = ib;
+        }
+    }
+    if (attn > ds4_gpu_tensor_bytes(g->loop_attn_state_kv)) {
+        ds4_gpu_tensor_free(g->loop_attn_state_kv);
+        ds4_gpu_tensor_free(g->loop_attn_state_score);
+        g->loop_attn_state_kv = ds4_gpu_tensor_alloc(attn);
+        g->loop_attn_state_score = ds4_gpu_tensor_alloc(attn);
+    }
+    if (index > ds4_gpu_tensor_bytes(g->loop_index_state_kv)) {
+        ds4_gpu_tensor_free(g->loop_index_state_kv);
+        ds4_gpu_tensor_free(g->loop_index_state_score);
+        g->loop_index_state_kv = ds4_gpu_tensor_alloc(index);
+        g->loop_index_state_score = ds4_gpu_tensor_alloc(index);
+    }
+    return (attn == 0 || (g->loop_attn_state_kv && g->loop_attn_state_score)) &&
+           (index == 0 || (g->loop_index_state_kv && g->loop_index_state_score));
+}
+
+static bool metal_graph_loop_mark(ds4_gpu_graph *g, uint32_t il, bool save) {
+    if (save) {
+        g->loop_mark_n_comp = g->layer_n_comp[il];
+        g->loop_mark_n_index_comp = g->layer_n_index_comp[il];
+    } else {
+        g->layer_n_comp[il] = g->loop_mark_n_comp;
+        g->layer_n_index_comp[il] = g->loop_mark_n_index_comp;
+    }
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio == 0) return true;
+#define LOOP_COPY(LAYER, SCRATCH) \
+    (save ? ds4_gpu_tensor_copy((SCRATCH), 0, (LAYER), 0, ds4_gpu_tensor_bytes(LAYER)) \
+          : ds4_gpu_tensor_copy((LAYER), 0, (SCRATCH), 0, ds4_gpu_tensor_bytes(LAYER)))
+    bool ok = LOOP_COPY(g->layer_attn_state_kv[il], g->loop_attn_state_kv) &&
+              LOOP_COPY(g->layer_attn_state_score[il], g->loop_attn_state_score);
+    if (ok && ratio == 4) {
+        ok = LOOP_COPY(g->layer_index_state_kv[il], g->loop_index_state_kv) &&
+             LOOP_COPY(g->layer_index_state_score[il], g->loop_index_state_score);
+    }
+#undef LOOP_COPY
+    return ok;
+}
+
+/* Encode one tape step: a decode layer, bracketed by the frontier save and
+ * restore when the pass is provisional. */
+static bool metal_graph_encode_tape_step(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           step,
+        uint32_t           pos,
+        uint32_t           raw_row,
+        uint32_t           n_raw,
+        int                token,
+        uint32_t          *il_out) {
+    bool provisional;
+    const uint32_t il = loop_tape_layer(&g->loop, step, NULL, &provisional);
+    if (il_out) *il_out = il;
+    bool ok = !provisional || metal_graph_loop_mark(g, il, true);
+    if (ok) {
+        ok = metal_graph_encode_decode_layer(g, model, &weights->layer[il], il, pos,
+                                             g->layer_raw_cache[il], g->raw_cap,
+                                             raw_row, n_raw, token);
+    }
+    if (ok && provisional) ok = metal_graph_loop_mark(g, il, false);
+    return ok;
+}
+
 static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -30418,7 +30553,9 @@ static bool metal_graph_encode_token_raw_swa(
     const bool tp_split_flush_safe = false;
 #endif
 
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    const uint32_t tape_steps = loop_tape_len(&g->loop);
+    for (uint32_t step = 0; ok && step < tape_steps; step++) {
+        const uint32_t il = loop_tape_layer(&g->loop, step, NULL, NULL);
 #if defined(__APPLE__)
         if (g->tp_world == 2) {
             /* Gate-time prefetch plans: this layer's FFN-side weights while
@@ -30484,16 +30621,8 @@ static bool metal_graph_encode_token_raw_swa(
             }
         }
 #endif
-        ok = metal_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             raw_row,
-                                             n_raw,
-                                             token);
+        ok = metal_graph_encode_tape_step(g, model, weights, step, pos,
+                                          raw_row, n_raw, token, NULL);
         ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
         g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
         g->after_ffn_hc_by_tier[g->active_tier] = tmp;
@@ -30508,9 +30637,9 @@ static bool metal_graph_encode_token_raw_swa(
          * in a distinct layer/gate slot and is safe to submit in-order. */
         if (ok && allow_split_flush &&
             (g->tp_world != 2 || tp_split_flush_safe) &&
-            ((split_after_layers != 0 && il + 1u == split_after_layers) ||
+            ((split_after_layers != 0 && step + 1u == split_after_layers) ||
              (second_split_after_layers != 0 &&
-              il + 1u == second_split_after_layers))) {
+              step + 1u == second_split_after_layers))) {
             ok = ds4_gpu_flush_commands() != 0;
         }
     }
@@ -34177,18 +34306,12 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                                            DS4_N_EMBD,
                                            DS4_N_HC) != 0;
     }
+    const uint32_t tape_steps = loop_tape_len(&g->loop);
     if (batch_static_decode) {
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            ok = metal_graph_encode_decode_layer(g,
-                                                 model,
-                                                 &weights->layer[il],
-                                                 il,
-                                                 pos,
-                                                 g->layer_raw_cache[il],
-                                                 g->raw_cap,
-                                                 raw_row,
-                                                 n_raw,
-                                                 token);
+        for (uint32_t step = 0; ok && step < tape_steps; step++) {
+            uint32_t il;
+            ok = metal_graph_encode_tape_step(g, model, weights, step, pos,
+                                              raw_row, n_raw, token, &il);
             if (ok) {
                 ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
                 g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
@@ -34230,30 +34353,26 @@ static bool metal_graph_eval_token_raw_swa_streaming(
 
     double encode_s = 0.0;
     double execute_s = 0.0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    for (uint32_t step = 0; ok && step < tape_steps; step++) {
         const double tl0 = profile ? now_sec() : 0.0;
+        const uint32_t il = loop_tape_layer(&g->loop, step, NULL, NULL);
         if (!static_decode_map && !metal_graph_stream_map_layer_decode(model, weights, il)) {
             ok = false;
             break;
         }
-        if (!static_decode_map && il + 1 < DS4_N_LAYER) {
-            metal_graph_stream_readahead_layer_decode(model, weights, il + 1);
+        /* Read ahead whatever the tape runs next: with loops the recurrent
+         * block wraps back to its first layer. */
+        if (!static_decode_map && step + 1 < tape_steps) {
+            metal_graph_stream_readahead_layer_decode(
+                    model, weights, loop_tape_layer(&g->loop, step + 1, NULL, NULL));
         } else if (!static_decode_map && logits) {
             metal_graph_stream_readahead_output(model, weights);
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         bool encoded_layer = false;
         if (ok) {
-            ok = metal_graph_encode_decode_layer(g,
-                                                 model,
-                                                 &weights->layer[il],
-                                                 il,
-                                                 pos,
-                                                 g->layer_raw_cache[il],
-                                                 g->raw_cap,
-                                                 raw_row,
-                                                 n_raw,
-                                                 token);
+            ok = metal_graph_encode_tape_step(g, model, weights, step, pos,
+                                              raw_row, n_raw, token, NULL);
             encoded_layer = true;
         }
         if (encoded_layer) {
@@ -73328,9 +73447,8 @@ static int ds4_engine_open_extensions(ds4_engine **out, const ds4_engine_options
     if (rc != 0 || !*out || !opt) return rc;
     ds4_engine *e = *out;
     char err[512] = {0};
-    if (opt->loop.num_loops > 1 && e->backend != DS4_BACKEND_CPU) {
-        snprintf(err, sizeof(err), "looped schedules require the CPU backend");
-    } else if (ds4_loop_config_check(&opt->loop, DS4_N_LAYER, err, sizeof(err)) == 0) {
+    /* Backend-specific limits are checked when sessions apply the schedule. */
+    if (ds4_loop_config_check(&opt->loop, DS4_N_LAYER, err, sizeof(err)) == 0) {
         e->loop_default = opt->loop;
         if (opt->wsp_script && opt->wsp_script[0] &&
             ds4_wsp_apply_script(e, opt->wsp_script, err, sizeof(err)) == 0) {
@@ -76366,6 +76484,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         ds4_session_free(s);
         return 1;
     }
+    if (e->loop_default.num_loops > 1) {
+        char err[256] = {0};
+        if (ds4_session_set_loops(s, &e->loop_default, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: %s\n", err);
+            ds4_session_free(s);
+            return 1;
+        }
+    }
     *out = s;
     return 0;
 #endif
@@ -76499,6 +76625,44 @@ int ds4_loop_config_check(const ds4_loop_config *cfg, int n_layer,
     return 0;
 }
 
+/* Graph backends (CUDA, Metal) run LAST mode: the decode tape needs no extra
+ * KV memory, only a scratch copy of one compressor frontier.  Everything
+ * that encodes a different layer sequence than the tape (speculative verify
+ * blocks, multi-GPU tiers, tensor parallel gates) is refused rather than
+ * silently left on the stock schedule. */
+static int session_graph_set_loops(ds4_session *s, const ds4_loop_config *next,
+                                   char *err, size_t errlen) {
+#ifdef DS4_NO_GPU
+    (void)s;
+    if (next->num_loops == 1) return 0;
+    return ds4_api_err(err, errlen, "graph backend support is not compiled in");
+#else
+    ds4_engine *e = s->engine;
+    if (next->num_loops > 1) {
+        const char *why = NULL;
+        if (ds4_session_is_glm(s) || ds4_session_is_ds41(s) || ds4_session_is_qwen4(s))
+            why = "looped schedules support the DeepSeek V4 graph only";
+        else if (next->kv_mode != DS4_LOOP_KV_LAST)
+            why = "per-loop KV is implemented by the CPU backend only; use last-loop KV";
+        else if (s->distributed || e->tp.active || s->graph.tp_world == 2)
+            why = "looped schedules are not supported for distributed or tensor-parallel sessions";
+        else if (s->graph.placement || s->graph.cuda_tp_decode)
+            why = "looped schedules require a single-GPU placement";
+        else if (e->support_kind != DS4_SUPPORT_NONE)
+            why = "looped schedules cannot be combined with MTP or DSpark speculation";
+        if (why) return ds4_api_err(err, errlen, "%s", why);
+    }
+    const ds4_loop_config old = s->graph.loop;
+    s->graph.loop = *next;
+    if (loop_config_active(next) && !metal_graph_loop_reserve(&s->graph)) {
+        s->graph.loop = old;
+        return ds4_api_err(err, errlen, "cannot allocate loop frontier scratch");
+    }
+    s->loop.cfg = *next;
+    return 0;
+#endif
+}
+
 /* Policy, in one rule: the main cache always holds one row per position and
  * layer, so any schedule can continue from it.  Changing num_loops or the
  * recurrent range live therefore keeps the checkpoint, and the history simply
@@ -76512,10 +76676,7 @@ int ds4_session_set_loops(ds4_session *s, const ds4_loop_config *cfg,
     if (ds4_loop_config_check(cfg, DS4_N_LAYER, err, errlen) != 0) return 1;
     ds4_loop_config next = *cfg;
     if (next.num_loops == 0) next.num_loops = 1;
-    if (!ds4_session_is_cpu(s)) {
-        if (next.num_loops == 1) return 0;
-        return ds4_api_err(err, errlen, "looped schedules require the CPU backend");
-    }
+    if (!ds4_session_is_cpu(s)) return session_graph_set_loops(s, &next, err, errlen);
     if (next.num_loops > 1 && (s->distributed || s->engine->tp.active))
         return ds4_api_err(err, errlen,
                            "looped schedules are not supported for distributed sessions");
@@ -79095,6 +79256,38 @@ int ds4_session_sync_multimodal(
     return rc;
 }
 
+#ifndef DS4_NO_GPU
+/* Extend a valid DS4 graph checkpoint to prompt one decode step at a time. */
+static int session_graph_extend_by_decode(ds4_session *s, const ds4_tokens *prompt,
+                                          char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    for (int i = s->checkpoint.len; i < prompt->len; i++) {
+        if (ds4_session_cancelled(s)) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                            (uint32_t)prompt->v[i],
+                                            (uint32_t)s->checkpoint.len,
+                                            s->logits))
+        {
+            snprintf(err, errlen, "%s decode failed while extending checkpoint",
+                     ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, prompt->v[i]);
+        s->checkpoint_valid = true;
+        ds4_session_dspark_capture_note_checkpoint(s);
+        if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+    }
+    session_greedy_splitkv_reset(s);
+    return 0;
+}
+#endif
+
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
@@ -80147,7 +80340,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+        if (suffix > 0 && (uint32_t)suffix >= resume_min &&
+            !loop_config_active(&s->graph.loop)) {
             bool cancelled = false;
             ds4_sync_progress progress = {
                 .session = s,
@@ -80188,29 +80382,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             return 0;
         }
 
-        for (int i = s->checkpoint.len; i < prompt->len; i++) {
-            if (ds4_session_cancelled(s)) {
-                snprintf(err, errlen, "interrupted");
-                s->checkpoint_valid = true;
-                s->mtp_draft_valid = false;
-                return DS4_SESSION_SYNC_INTERRUPTED;
-            }
-            if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
-                                                (uint32_t)prompt->v[i],
-                                                (uint32_t)s->checkpoint.len,
-                                                s->logits))
-            {
-                snprintf(err, errlen, "%s decode failed while extending checkpoint", backend_name);
-                s->checkpoint_valid = false;
-                return 1;
-            }
-            token_vec_push(&s->checkpoint, prompt->v[i]);
-            s->checkpoint_valid = true;
-            ds4_session_dspark_capture_note_checkpoint(s);
-            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
-        }
-        session_greedy_splitkv_reset(s);
-        return 0;
+        return session_graph_extend_by_decode(s, prompt, err, errlen);
     }
 
     bool ok;
@@ -80221,6 +80393,13 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
+    }
+    if (loop_config_active(&s->graph.loop)) {
+        /* Batched prefill implements only the stock layer sequence, so a
+         * looped session rebuilds through the decode tape, one position at a
+         * time, from the empty state the reset just produced. */
+        s->checkpoint_valid = true;
+        return session_graph_extend_by_decode(s, prompt, err, errlen);
     }
     if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
@@ -84202,10 +84381,13 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     }
 
 #ifndef DS4_NO_GPU
-    if (e->backend == DS4_BACKEND_CUDA) {
+    /* Native batches encode the stock layer sequence for every member. */
+    bool looped = false;
+    for (int i = 0; i < count; i++) looped |= items[i].session->loop.cfg.num_loops > 1;
+    if (!looped && e->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_cuda(items, count, err, errlen);
     }
-    if (ds4_sessions_eval_batch_metal_supported(items, count, e)) {
+    if (!looped && ds4_sessions_eval_batch_metal_supported(items, count, e)) {
         return ds4_sessions_eval_batch_native(items, count, e, NULL, NULL, err, errlen);
     }
 #endif

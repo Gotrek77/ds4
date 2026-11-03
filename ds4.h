@@ -153,7 +153,9 @@ typedef struct {
  *           num_loops is free; raising it past the levels that saw the whole
  *           history invalidates the checkpoint and the next sync rebuilds.
  *
- * Looped schedules are implemented by the CPU reference backend. */
+ * The CPU backend implements both modes.  The DeepSeek V4 graph (CUDA,
+ * Metal) implements LAST on a single GPU, including SSD streaming; it rejects
+ * PER_LOOP, multi-GPU/TP placements and MTP/DSpark speculation. */
 typedef enum {
     DS4_LOOP_KV_LAST = 0,
     DS4_LOOP_KV_PER_LOOP = 1,

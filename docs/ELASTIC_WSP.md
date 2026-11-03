@@ -10,11 +10,12 @@ plugs in.
 | Weight-space programming | bytes of the private model mapping | `ds4_wsp_*()` |
 | Coarse-to-fine decoding | what a decode step emits and feeds back | `ds4_mlc_*()`, `ds4_session_step()` |
 
-All three run on the CPU backend (`--cpu`), where weights are plain pointers
-into the GGUF mapping and every layer pass is an explicit C call. The graph
-backends (Metal, CUDA, ROCm) keep their exact behavior and refuse these
-requests with an error rather than half-supporting them. Porting needs one
-hook per backend, described at the end.
+The CPU backend (`--cpu`) runs all three: its weights are plain pointers into
+the GGUF mapping and every layer pass is an explicit C call. The DeepSeek V4
+graph (CUDA, Metal) runs elastic loops in LAST mode on a single GPU, with or
+without SSD streaming. Anything the graph does not support is refused with an
+error rather than half-supported. The remaining ports are described at the
+end.
 
 ## 1. Elastic looped transformer
 
@@ -61,9 +62,35 @@ function. Disk/snapshot payloads describe stock state, so looped sessions
 refuse to save them, and stock payloads cannot be loaded into looped sessions.
 
 ```sh
-./ds4 --cpu --loop-block 20:28 --loops 3 --loop-kv last -p "..."
+./ds4 --cuda --loop-block 20:28 --loops 3 -p "..."      # LAST mode
+./ds4 --cpu  --loop-block 20:28 --loops 3 --loop-kv per-loop -p "..."
 # REPL: /loops 1   /loops 4
 ```
+
+### On the graph backends
+
+`metal_graph_encode_token_raw_swa()` (in-memory weights) and the SSD-streaming
+decode walk the same tape as the CPU (`loop_tape_layer()`). A provisional
+pass leaves less state behind on the graph than on the CPU:
+
+- raw rows live in a ring at `pos % raw_cap`, so the final pass rewrites the
+  row a provisional pass wrote;
+- compressed and indexer rows are appended at host counters, so restoring the
+  counters makes the final pass rewrite the same rows;
+- the compressor frontiers are the only bytes to save and restore. They are
+  copied into one scratch set with device copies queued between the layer
+  kernels, so nothing synchronizes.
+
+CUDA decode-island graphs are keyed by layer and buffer addresses, so a
+repeated layer replays the island it would have replayed anyway. Batched
+prefill and native multi-session batches encode the stock layer sequence:
+looped sessions prefill through the decode tape one token at a time, and
+batches containing a looped session are serialized. Streaming readahead
+follows the tape, so the first recurrent layer is prefetched again when the
+block wraps.
+
+Refused on the graph: PER_LOOP KV, GLM/Qwen/V4.1 graphs, multi-GPU placements,
+tensor parallel, distributed sessions, and MTP/DSpark speculation.
 
 ## 2. Weight-Space Programming
 
@@ -145,14 +172,15 @@ fine-tuning that makes the model use them) come from outside.
 
 ## Porting to the graph backends
 
-- Loops: the graph decode builds a per-layer command list. A looped
-  schedule repeats layers `[a,b)` and, in LAST mode, needs a device-side
-  mark/restore of the raw ring and compressor states. PER_LOOP needs extra
-  per-layer KV tensors.
-- WSP: Metal wraps the shared mapping as no-copy buffers, so the engine would
-  need a private copy of the edited tensors plus a buffer rebind. CUDA/ROCm
-  need a re-upload of the touched span. `wsp_mark_dirty()` already records
-  exactly that span.
+- PER_LOOP on the graph: extra per-layer raw/compressed KV tensors for each
+  loop level, selected by the tape's loop index.
+- WSP: graph backends map the GGUF `MAP_SHARED`, so host edits would write the
+  file. Metal wraps the mapping as no-copy buffers and would need a private
+  copy of the edited tensors plus a buffer rebind. CUDA keeps device copies of
+  weight ranges plus derived artifacts (Q8 to F16/F32 caches, repacked
+  experts), so an edit must update the device range and rebuild or invalidate
+  every artifact derived from it. `wsp_mark_dirty()` already records the
+  touched span.
 - Concepts: the graph backends already accept embedding rows for vision
   spans. A concept step is one such row.
 

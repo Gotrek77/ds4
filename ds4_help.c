@@ -235,11 +235,11 @@ static void print_steering(FILE *fp, const help_colors *c) {
 }
 
 static void print_elastic(FILE *fp, const help_colors *c) {
-    title(fp, c, "Elastic Loops and Weight Patches (CPU backend)");
+    title(fp, c, "Elastic Loops and Weight Patches");
     opt(fp, c, "--loops N", "Run the recurrent block N times per token. Default: 1 (stock model)");
     opt(fp, c, "--loop-block A:B", "Recurrent block: layers A..B-1. Layers before run once as input block, after as output block.");
-    opt(fp, c, "--loop-kv last|per-loop", "KV ownership: final pass only (no extra memory) or one cache per loop. Default: last");
-    opt(fp, c, "--wsp FILE", "Apply a weight-space patch script after load (see gguf-tools/wsp.py).");
+    opt(fp, c, "--loop-kv last|per-loop", "KV ownership: final pass only (no extra memory; CPU, CUDA, Metal) or one cache per loop (CPU). Default: last");
+    opt(fp, c, "--wsp FILE", "Apply a weight-space patch script after load (CPU backend; see gguf-tools/wsp.py).");
     fputc('\n', fp);
 }
 
@@ -314,7 +314,7 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     opt(fp, c, "/think [N], /think-max, /nothink", "Switch thinking mode; V4.1 accepts effort 0..100.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
-    opt(fp, c, "/loops [N]", "Set recurrent block passes for following tokens (CPU, needs --loop-block).");
+    opt(fp, c, "/loops [N]", "Set recurrent block passes for following tokens (needs --loop-block).");
     opt(fp, c, "/read FILE", "Submit a text file, PNG, or JPEG as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
     opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
