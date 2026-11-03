@@ -14,6 +14,26 @@ make cuda-spark
 ./ds4 --cuda
 ```
 
+### Without a host CUDA toolkit: Docker
+
+If the Spark has the NVIDIA driver and the NVIDIA container toolkit but no
+`nvcc`, build and run inside a CUDA container. The repository is mounted at its
+host path, so binaries, models and outputs stay on the host. The binaries link
+the container's CUDA libraries, so run them through the same script:
+
+```sh
+nvidia-smi                                  # note "CUDA Version" (driver limit)
+docker/ds4-docker.sh image                  # CUDA_VERSION=13.0.2 by default
+docker/ds4-docker.sh make                   # make cuda-spark inside the container
+docker/ds4-docker.sh run ./ds4 --cuda -m gguf/DeepSeek-V4-Flash-....gguf
+```
+
+Use a `CUDA_VERSION` (an `nvidia/cuda:<version>-devel-ubuntu24.04` tag, 12.9
+or newer for GB10) not above the driver's reported version, e.g.
+`CUDA_VERSION=13.0.2`. If `gguf/` is a symlink, its target is mounted
+automatically. Mount other directories with
+`DS4_DOCKER_MOUNTS="/data/models /scratch"`.
+
 The build targets GB10 (`sm_121a`) and enables the Blackwell-specific kernels.
 Do not use `--cuda-tensor-parallel` on a single Spark.
 Stop other inference services before loading a model so they do not compete
