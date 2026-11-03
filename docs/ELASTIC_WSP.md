@@ -225,3 +225,66 @@ ends (`eos`) and how much it repeats (`distinct2`). Results land in
 the typical failure: an answer that starts well and never stops. That is why
 the second run checks free generation. Rerunning the script skips schedules
 already in `elastic-sweep/results.csv`.
+
+### Results: DeepSeek V4 Flash Q2 (November 2026)
+
+The model was `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`,
+run on a DGX Spark with `--cuda` and the whole model in memory (LAST KV mode).
+Perplexity was measured on 512 tokens of `README.md`. Free generation was
+greedy, `--nothink`, up to 96 tokens, on "Ciao! Presentati in due frasi."
+`eos -1` means the answer never ended.
+
+| block | loops | passes | ppl | vs stock | eos | distinct2 |
+|---|---|---|---|---|---|---|
+| stock | 1 | 43 | 13.96 | 1.000x | 43 | 1.000 |
+| 4:6 | 2 | 45 | 14.04 | 1.006x | 49 | 1.000 |
+| 12:14 | 2 | 45 | 14.25 | 1.021x | 59 | 0.966 |
+| 4:6 | 3 | 47 | 14.53 | 1.041x | 58 | 1.000 |
+| 12:16 | 2 | 47 | 14.56 | 1.043x | 35 | 1.000 |
+| 20:22 | 2 | 45 | 14.75 | 1.057x | 47 | 1.000 |
+| 4:8 | 2 | 47 | 14.76 | 1.057x | 54 | 1.000 |
+| 12:14 | 3 | 47 | 14.87 | 1.065x | 49 | 1.000 |
+| 20:24 | 2 | 47 | 15.07 | 1.079x | 31 | 1.000 |
+| 35:37 | 2 | 45 | 15.21 | 1.090x | 30 | 1.000 |
+| 4:12 | 2 | 51 | 15.34 | 1.099x | 31 | 1.000 |
+| 4:8 | 3 | 51 | 15.84 | 1.135x | 51 | 0.960 |
+| 12:16 | 3 | 51 | 16.85 | 1.207x | 31 | 1.000 |
+| 20:22 | 3 | 47 | 16.86 | 1.208x | 56 | 1.000 |
+| 28:30 | 2 | 45 | 17.08 | 1.224x | 51 | 1.000 |
+| 20:24 | 3 | 51 | 17.32 | 1.241x | 31 | 1.000 |
+| 4:12 | 3 | 59 | 17.69 | 1.267x | 63 | 1.000 |
+| 35:39 | 2 | 47 | 17.83 | 1.277x | 48 | 0.979 |
+| 28:32 | 2 | 47 | 18.17 | 1.302x | 46 | 1.000 |
+| 35:37 | 3 | 47 | 20.07 | 1.438x | 36 | 1.000 |
+| 12:20 | 2 | 51 | 20.30 | 1.454x | 74 | 0.986 |
+| 28:36 | 2 | 51 | 24.40 | 1.748x | -1 | 0.347 |
+| 12:20 | 3 | 59 | 31.22 | 2.237x | 60 | 1.000 |
+| 28:30 | 3 | 47 | 32.37 | 2.319x | 42 | 1.000 |
+| 35:39 | 3 | 51 | 36.21 | 2.594x | 35 | 0.971 |
+| 28:32 | 3 | 51 | 42.00 | 3.009x | 54 | 1.000 |
+| 20:28 | 2 | 51 | 43.10 | 3.088x | 53 | 1.000 |
+| 35:43 | 2 | 51 | 295.77 | 21.19x | -1 | 0.158 |
+| 20:28 | 3 | 59 | 781.79 | 56.01x | -1 | 0.863 |
+| 28:36 | 3 | 59 | 1643.94 | 117.8x | -1 | 0.305 |
+| 35:43 | 3 | 59 | 3041.34 | 217.9x | -1 | 0.158 |
+
+What the sweep shows:
+
+- **No schedule improves the model.** Every looped schedule raises
+  perplexity. A model not trained to loop is only perturbed by repeated
+  layers; it does not "think more".
+- **Position matters most.** Early layers (4-16) repeat almost for free.
+  4:6 costs +0.6% with 2 loops and +4% with 3, and 4:12 with 3 loops adds 16
+  layer passes for 1.27x. Middle layers (20-24) are tolerable at 2 loops.
+  From layer 28 on, the model degrades quickly. Wide late blocks collapse:
+  the answer never ends, and repeats itself.
+- **Each extra loop costs more than the previous one.** Going from 2 to 3
+  loops costs much more than going from 1 to 2: 20:22 goes from 1.06x to
+  1.21x, 28:30 from 1.22x to 2.32x, and 20:28 from 3.1x to 56x. Every pass
+  pushes the hidden states further from anything seen in training.
+- **Late layers break generation before perplexity says so.** 28:36 with 2
+  loops is only 1.75x in perplexity, yet free generation never ends. Early
+  blocks keep generating sanely even above 2x. Both metrics are needed.
+
+Loops pay off only on models trained to loop. On DeepSeek V4 they are a probe
+of how much repetition each part of the stack tolerates, not a quality knob.
