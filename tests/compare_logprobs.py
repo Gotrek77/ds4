@@ -2,6 +2,7 @@
 """Compare two `ds4 --dump-logprobs` files step by step.
 
     python3 tests/compare_logprobs.py A.json B.json
+    python3 tests/compare_logprobs.py --text A.json    # print the continuation
 
 Reports how many greedy steps agree on the selected token, and the largest
 logprob difference over the tokens both runs list in their top-k.  Exit code
@@ -16,7 +17,21 @@ def load(path):
         return json.load(f)["steps"]
 
 
+def tid(tok):
+    """Tokens are {"id", "text", "bytes"} objects in ds4 dumps."""
+    return tok["id"] if isinstance(tok, dict) else tok
+
+
+def text(path):
+    """Greedy continuation of a dump, decoded from the token bytes."""
+    raw = b"".join(bytes(s["selected"]["bytes"]) for s in load(path))
+    return raw.decode("utf-8", errors="replace")
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--text":
+        print(text(sys.argv[2]))
+        return 0
     if len(sys.argv) != 3:
         print(__doc__)
         return 2
@@ -26,13 +41,13 @@ def main():
     sum_d = 0.0
     n_d = 0
     for sa, sb in zip(a, b):
-        if sa["selected"] != sb["selected"]:
+        if tid(sa["selected"]) != tid(sb["selected"]):
             break
         same_prefix += 1
-        lb = {t["token"]: t["logprob"] for t in sb["top_logprobs"]}
+        lb = {tid(t["token"]): t["logprob"] for t in sb["top_logprobs"]}
         for t in sa["top_logprobs"][:5]:
-            if t["token"] in lb:
-                d = abs(t["logprob"] - lb[t["token"]])
+            if tid(t["token"]) in lb:
+                d = abs(t["logprob"] - lb[tid(t["token"])])
                 max_d = max(max_d, d)
                 sum_d += d
                 n_d += 1

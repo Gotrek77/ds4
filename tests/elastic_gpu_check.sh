@@ -34,7 +34,7 @@ run() {   # name backend flags...
 }
 
 text() {  # greedy continuation of a dump, for eyeballing
-    python3 -c 'import json,sys; print("".join(s["selected"] for s in json.load(open(sys.argv[1]))["steps"]))' "$1" 2>/dev/null
+    python3 "$cmp_py" --text "$1"
 }
 
 run cuda-stock  --cuda
