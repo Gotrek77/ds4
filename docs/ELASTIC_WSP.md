@@ -89,6 +89,15 @@ batches containing a looped session are serialized. Streaming readahead
 follows the tape, so the first recurrent layer is prefetched again when the
 block wraps.
 
+LAST-mode prefill is inherently sequential, not merely unoptimized: loop `k`
+of token `t` must attend to the final rows of earlier tokens, which exist only
+after those tokens have run every loop. A layer-major batch cannot respect
+that dependency. PER_LOOP would batch, because each loop attends only to its
+own loop's rows. With SSD streaming on CUDA, the expert cache has no automatic
+budget. Stock sessions grow it as a side effect of wide prefill requests,
+which looped sessions never issue. Pass `--ssd-streaming-cache-experts N` so
+experts are reused across tokens; the engine warns when it is missing.
+
 Refused on the graph: PER_LOOP KV, GLM/Qwen/V4.1 graphs, multi-GPU placements,
 tensor parallel, distributed sessions, and MTP/DSpark speculation.
 

@@ -76652,6 +76652,19 @@ static int session_graph_set_loops(ds4_session *s, const ds4_loop_config *next,
             why = "looped schedules cannot be combined with MTP or DSpark speculation";
         if (why) return ds4_api_err(err, errlen, "%s", why);
     }
+    /* LAST mode prefills through the decode tape, so it never issues the
+     * wide prefill requests that grow an unbudgeted CUDA expert cache: the
+     * cache would stay at one token's experts and reload them every token. */
+    if (loop_config_active(next) && e->ssd_streaming &&
+        ds4_gpu_stream_expert_cache_configured_count() == 0) {
+        static bool warned;
+        if (!warned) {
+            fprintf(stderr, "ds4: looped schedules prefill through decode and do not grow the "
+                            "SSD expert cache; set --ssd-streaming-cache-experts N "
+                            "(e.g. 1000, ~7 GB for Flash Q2) to reuse experts across tokens\n");
+            warned = true;
+        }
+    }
     const ds4_loop_config old = s->graph.loop;
     s->graph.loop = *next;
     if (loop_config_active(next) && !metal_graph_loop_reserve(&s->graph)) {
