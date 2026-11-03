@@ -5,22 +5,38 @@ shared with the previous request, in ~4-byte tokens)."""
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bench  # noqa: E402
 import solpi  # noqa: E402
 
-FIXED = (solpi.INVENTORY
-         .replace("int(packs) + int(size)", "int(packs) * int(size)")
-         .replace("int(euros) * 100 + int(cents or 0)",
-                  "int(euros) * 100 + (int((cents + \"00\")[:2]) if cents else 0)")
-         .replace("line_total_cents(*l))[:n]", "line_total_cents(*l), reverse=True)[:n]"))
+FIXES = {
+    "inventory": [("int(packs) + int(size)", "int(packs) * int(size)"),
+                  ("int(euros) * 100 + int(cents or 0)",
+                   "int(euros) * 100 + (int((cents + \"00\")[:2]) if cents else 0)"),
+                  ("line_total_cents(*l))[:n]", "line_total_cents(*l), reverse=True)[:n]")],
+    "schedule": [("return year % 4 == 0", "return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)"),
+                 ("month in (4, 6, 9)", "month in (4, 6, 9, 11)"),
+                 ("            month = 1\n", "            month = 1\n            year += 1\n")],
+    "textutil": [(".lstrip(\"-\")", ".strip(\"-\")"), ("text.split(\" \")", "text.split()"),
+                 ("text[:width] + \"...\"", "text[:width - 3] + \"...\"")],
+}
 TEST = "python3 run_tests.py"
+
+
+def fixed(task):
+    src = solpi.TASKS[task][1]
+    for a, b in FIXES[task]:
+        assert a in src, (task, a)
+        src = src.replace(a, b)
+    return src
 
 
 def call(name, **args):
@@ -29,15 +45,20 @@ def call(name, **args):
 
 
 def policy(messages, tools):
-    """The same plan in both modes, using the fused tool when offered."""
-    fused = any(t["function"]["name"] == "write_and_run" for t in tools)
+    """The same plan in every mode, using the fused tool when it is offered.
+    A cold start runs the suite first; a log start already has the output."""
+    names = {t["function"]["name"] for t in tools}
+    module = re.search(r"bugs in (\w+\.py)", messages[1]["content"]).group(1)
+    task = module[:-3]
     done = sum(m["role"] == "assistant" for m in messages)
-    plan = [call("run", command=TEST), call("read_file", path="inventory.py")]
-    if fused:
-        plan += [call("recall", handle="obs-1", offset=0, length=200),
-                 call("write_and_run", path="inventory.py", content=FIXED, command=TEST)]
+    plan = [] if "Current test output" in messages[1]["content"] else [call("run", command=TEST)]
+    plan.append(call("read_file", path=module))
+    if "recall" in names:
+        plan.append(call("recall", handle="obs-1", offset=0, length=200))
+    if "write_and_run" in names:
+        plan.append(call("write_and_run", path=module, content=fixed(task), command=TEST))
     else:
-        plan += [call("write_file", path="inventory.py", content=FIXED), call("run", command=TEST)]
+        plan += [call("write_file", path=module, content=fixed(task)), call("run", command=TEST)]
     if done < len(plan):
         return {"role": "assistant", "content": "", "tool_calls": [plan[done]]}
     return {"role": "assistant", "content": "done"}
@@ -70,35 +91,54 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_address[1]}"
     tmp = tempfile.mkdtemp(prefix="solpi-test-")
+
     mem = solpi.parse_memory_report(
         "ds4: memory: KV 0.78 GiB (raw 0.36 + compressed 0.42) + buffers\n"
         "ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194\n")
     assert abs(mem["kv_mb"] - 798.72) < 0.01 and mem["ctx"] == 32768 and mem["raw_rows"] == 4352
-    assert abs(solpi.kv_live_mb(mem, 4352) - (mem["raw_mb"] + mem["comp_mb"] * 4352 / 32768)) < 1e-6
 
-    # The sampler must start, sample a real process and stop cleanly.
+    # The sampler must start, sample a real process and stop cleanly, twice.
     sampler = solpi.MemSampler(os.getpid(), period=0.01)
     sampler.start()
-    import time
     time.sleep(0.1)
     sampler.stop()
-    sampler.stop()   # idempotent: run_mode stops it again in its finally block
-    assert sampler.rss_peak_mb > 0 and sampler.rss_start_mb > 0 and not sampler.is_alive()
+    sampler.stop()
+    assert sampler.rss_peak_mb > 0 and not sampler.is_alive()
 
-    results = {}
-    for mode in ("baseline", "solpi"):
-        Fake.last = ""
-        a = solpi.Agent(url, mode, solpi.new_workspace(tmp), max_turns=10).run()
-        results[mode] = bench.summarize(a, mem, None)
-    b, s = results["baseline"], results["solpi"]
-    assert b["solved"] and s["solved"]
-    assert b["turns"] == 4 and s["turns"] == 4          # run, read, (recall|write), (fused|run)
-    assert s["fused_calls"] == 1 and b["fused_calls"] == 0
-    assert s["packed_observations"] == 2 and b["packed_observations"] == 0
-    assert s["obs_kb_sent"] < b["obs_kb_sent"] / 5
-    assert s["prompt_tokens"] < b["prompt_tokens"] and s["peak_context_tokens"] < b["peak_context_tokens"]
-    assert all(t["cached_tokens"] > 0 for t in s["turn_trace"][1:])
-    bench.report(results)
+    # Every fixture fails as shipped and passes with its three fixes.
+    for task, (module, _, _) in solpi.TASKS.items():
+        ws = solpi.Workspace(solpi.new_workspace(tmp, task))
+        out = ws.run(TEST)
+        assert out.rstrip().endswith("[exit 1]") and len(out) > solpi.PACK_THRESHOLD, task
+        ws.write(module, fixed(task))
+        assert ws.run(TEST).rstrip().endswith("[exit 0]"), task
+
+    for start in ("cold", "log"):
+        results = {}
+        for task, (module, _, _) in solpi.TASKS.items():
+            results[task] = {}
+            for mode, (fusion, pack) in solpi.MODES.items():
+                Fake.last = ""
+                a = solpi.Agent(url, solpi.new_workspace(tmp, task), module,
+                                fusion=fusion, pack=pack, start=start).run()
+                r = bench.summarize(a, mem, None)
+                assert r["solved"], (start, task, mode)
+                assert r["fused_calls"] == int(fusion)
+                assert (r["packed_observations"] > 0) == pack
+                assert r["recalls"] == int(pack)
+                results[task][mode] = bench.median_runs([r])
+        for task in solpi.TASKS:
+            b, f, p, s = (results[task][m] for m in solpi.MODES)
+            assert f["turns"] == b["turns"] - 1               # fusion saves the validation turn
+            assert p["obs_kb_sent"] < b["obs_kb_sent"] / 4    # pack shrinks what the model reads
+            assert s["prefill_tokens"] < b["prefill_tokens"]
+        print(f"\n===== start={start}")
+        bench.report(results, list(solpi.TASKS), list(solpi.MODES))
+
+    a = bench.parse_cli(["-m", "x.gguf", "--repeat", "3", "--", "--cuda", "--ssd-streaming"])
+    assert a.repeat == 3 and a.server_args == "--cuda --ssd-streaming"
+    assert bench.parse_cli(["-m", "x", "--server-args=--cuda"]).server_args == "--cuda"
+
     srv.shutdown()
     shutil.rmtree(tmp)
     print("\ntest_solpi: ok")

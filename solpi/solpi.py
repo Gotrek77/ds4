@@ -196,16 +196,27 @@ BASE_TOOLS = [
          command=("string", "Shell command.")),
 ]
 
-SOLPI_TOOLS = BASE_TOOLS + [
+FUSION_TOOLS = [
     tool("write_and_run",
          "Replace a file and immediately run a validation command, in one call. "
          "Prefer this over write_file followed by run.",
          path=("string", "Relative path."), content=("string", "Full new file content."),
          command=("string", "Validation command to run after writing.")),
+]
+
+PACK_TOOLS = [
     tool("recall", "Read exact bytes of a packed observation by handle.",
          handle=("string", "Observation handle, e.g. obs-1."),
          offset=("integer", "Byte offset."), length=("integer", "Bytes to read (max 4096).")),
 ]
+
+# Ablation modes: each SoL-Pi mechanism alone, then both.
+MODES = {
+    "baseline": (False, False),
+    "fusion": (True, False),
+    "pack": (False, True),
+    "solpi": (True, True),
+}
 
 
 class ObservationPack:
@@ -261,8 +272,11 @@ class Workspace:
 
     def run(self, command):
         try:
+            # No bytecode cache: a fix written within the same second as the
+            # last run and with the same size would otherwise run stale code.
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
             r = subprocess.run(["bash", "-c", command], cwd=self.root, capture_output=True,
-                               text=True, timeout=RUN_TIMEOUT)
+                               text=True, timeout=RUN_TIMEOUT, env=env)
             return f"$ {command}\n{r.stdout}{r.stderr}[exit {r.returncode}]"
         except subprocess.TimeoutExpired:
             return f"$ {command}\n[timeout after {RUN_TIMEOUT}s]"
@@ -273,25 +287,34 @@ class Workspace:
 SYSTEM = ("You are a careful software engineer working in a small Python project. "
           "Use the tools to find and fix the bugs until `python3 run_tests.py` passes. "
           "Be brief: act with tools, do not explain at length.")
-SOLPI_HINT = (" When you change a file, use write_and_run to write it and run the tests in one "
-              "step. Long outputs are packed: the first and last KB are shown and recall() "
-              "pages the rest only if you need it.")
-TASK = "The test suite fails. Fix the bugs in inventory.py so that `python3 run_tests.py` passes."
+FUSION_HINT = (" When you change a file, use write_and_run to write it and run the tests in "
+               "one step.")
+PACK_HINT = (" Long outputs are packed: the first and last KB are shown and recall() pages "
+             "the rest only if you need it.")
+TEST_CMD = "python3 run_tests.py"
 
 
 class Agent:
-    """One agent episode on a fresh workspace, in baseline or SoL-Pi mode."""
+    """One agent episode on a fresh workspace.
 
-    def __init__(self, url, mode, workspace, max_turns=10, max_tokens=4096, solved_cmd=None):
-        assert mode in ("baseline", "solpi")
-        self.url, self.mode, self.ws = url, mode, Workspace(workspace)
+    fusion and pack select the SoL-Pi mechanisms.  start="log" opens the
+    episode with the failing test output in the task message (full, or packed
+    when pack is on), so every mode must read the failures and the comparison
+    does not hinge on a lucky first fix; start="cold" lets the agent explore."""
+
+    def __init__(self, url, workspace, module, fusion=False, pack=False, start="log",
+                 max_turns=10, max_tokens=4096):
+        assert start in ("log", "cold")
+        self.url, self.ws, self.module = url, Workspace(workspace), module
+        self.fusion, self.start = fusion, start
         self.max_turns, self.max_tokens = max_turns, max_tokens
-        self.solved_cmd = solved_cmd or "python3 run_tests.py > /dev/null 2>&1"
-        self.pack = ObservationPack() if mode == "solpi" else None
-        self.tools = SOLPI_TOOLS if mode == "solpi" else BASE_TOOLS
+        self.pack = ObservationPack() if pack else None
+        self.tools = BASE_TOOLS + (FUSION_TOOLS if fusion else []) + (PACK_TOOLS if pack else [])
+        self.mode = {v: k for k, v in MODES.items()}[(fusion, pack)]
         self.turns = []        # one record per model request
         self.tool_calls = 0
         self.fused_calls = 0
+        self.recalls = 0
         self.packed = 0
         self.obs_bytes_raw = 0
         self.obs_bytes_sent = 0
@@ -304,38 +327,52 @@ class Agent:
             return self.ws.write(args["path"], args["content"])
         if name == "run":
             return self.ws.run(args["command"])
-        if self.mode == "solpi" and name == "write_and_run":
+        if self.fusion and name == "write_and_run":
             self.fused_calls += 1
             return self.ws.write(args["path"], args["content"]) + "\n" + self.ws.run(args["command"])
-        if self.mode == "solpi" and name == "recall":
+        if self.pack and name == "recall":
+            self.recalls += 1
             return self.pack.recall(args["handle"], args.get("offset", 0), args.get("length", RECALL_MAX))
         return f"error: unknown tool {name}"
 
-    def observe(self, name, args):
-        try:
-            out = self._execute(name, args)
-        except Exception as e:  # tool errors are observations, not crashes
-            out = f"error: {e}"
-        raw = len(out.encode("utf-8", "replace"))
-        self.obs_bytes_raw += raw
-        # The episode ends when the agent itself has seen the suite pass: a
-        # harness-side oracle would let the baseline skip the validation turn
-        # that Action Fusion exists to save.
-        if name in ("run", "write_and_run") and "run_tests" in str(args.get("command", "")) \
-                and out.rstrip().endswith("[exit 0]"):
-            self.passed_seen = True
+    def _deliver(self, name, out):
+        """Account an observation and pack it when ObservationPack is on."""
+        self.obs_bytes_raw += len(out.encode("utf-8", "replace"))
         if self.pack and name != "recall":
             out, packed = self.pack.pack(out)
             self.packed += packed
         self.obs_bytes_sent += len(out.encode("utf-8", "replace"))
         return out
 
+    def observe(self, name, args):
+        try:
+            out = self._execute(name, args)
+        except Exception as e:  # tool errors are observations, not crashes
+            out = f"error: {e}"
+        # The episode ends when the agent itself has seen the suite pass: a
+        # harness-side oracle would let the baseline skip the validation turn
+        # that Action Fusion exists to save.
+        if name in ("run", "write_and_run") and "run_tests" in str(args.get("command", "")) \
+                and out.rstrip().endswith("[exit 0]"):
+            self.passed_seen = True
+        return self._deliver(name, out)
+
     def solved(self):
-        return subprocess.run(["bash", "-c", self.solved_cmd], cwd=self.ws.root).returncode == 0
+        cmd = TEST_CMD + " > /dev/null 2>&1"
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        return subprocess.run(["bash", "-c", cmd], cwd=self.ws.root, env=env).returncode == 0
+
+    def task_message(self):
+        task = (f"The test suite fails. Fix the bugs in {self.module} so that "
+                f"`{TEST_CMD}` passes.")
+        if self.start == "cold":
+            return task
+        return task + "\n\nCurrent test output:\n" + self._deliver("run", self.ws.run(TEST_CMD))
 
     def run(self):
-        messages = [{"role": "system", "content": SYSTEM + (SOLPI_HINT if self.pack else "")},
-                    {"role": "user", "content": TASK}]
+        system = SYSTEM + (FUSION_HINT if self.fusion else "") + (PACK_HINT if self.pack else "")
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": self.task_message()}]
         t0 = time.time()
         for _ in range(self.max_turns):
             payload = {"model": "deepseek-v4-flash", "messages": messages, "tools": self.tools,
@@ -378,7 +415,11 @@ class Agent:
         return self
 
 
-# ---------------------------------------------------------------- fixture
+# ---------------------------------------------------------------- fixtures
+
+# Every task is a small module with three bugs and a verbose suite (one log
+# line per case, ~25-40 KB) whose last lines hold failure examples and a
+# per-function summary, so a packed view's last KB carries what matters.
 
 INVENTORY = '''\
 """Order arithmetic for a small shop."""
@@ -408,26 +449,59 @@ def top_lines(lines, n):
     return sorted(lines, key=lambda l: line_total_cents(*l))[:n]
 '''
 
-RUN_TESTS = r'''"""Verbose regression suite: one log line per case, summary at the end."""
+SCHEDULE = '''\
+"""Calendar helpers for a booking system."""
+
+
+def is_leap(year):
+    return year % 4 == 0
+
+
+def days_in_month(year, month):
+    if month == 2:
+        return 29 if is_leap(year) else 28
+    return 30 if month in (4, 6, 9) else 31
+
+
+def add_days(year, month, day, n):
+    """The date n >= 0 days after (year, month, day), as a tuple."""
+    day += n
+    while day > days_in_month(year, month):
+        day -= days_in_month(year, month)
+        month += 1
+        if month > 12:
+            month = 1
+    return year, month, day
+'''
+
+TEXTUTIL = '''\
+"""Text helpers for a static site generator."""
+import re
+
+
+def slugify(title):
+    """Lowercase; every run of non-alphanumerics becomes one '-'; no '-' at the ends."""
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).lstrip("-")
+
+
+def word_count(text):
+    """Number of whitespace-separated words."""
+    return len(text.split(" "))
+
+
+def truncate(text, width):
+    """At most `width` characters; a cut text ends with '...' counted in the width."""
+    if len(text) <= width:
+        return text
+    return text[:width] + "..."
+'''
+
+RUNNER_HEAD = r'''"""Verbose regression suite: one log line per case, summary at the end."""
 import random
 import sys
 import time
 
-import inventory
-
-
-def ref_qty(t):
-    t = t.strip()
-    if "x" in t:
-        a, b = t.split("x")
-        return int(a) * int(b)
-    return int(t)
-
-
-def ref_cents(p):
-    e, _, c = p.partition(".")
-    return int(e) * 100 + int((c + "00")[:2]) if c else int(e) * 100
-
+import MODULE as m
 
 rng = random.Random(1234)
 fails = {}
@@ -444,20 +518,9 @@ def check(fn, arg, got, want):
     if got != want:
         fails.setdefault(fn, []).append((arg, got, want))
 
+'''
 
-for _ in range(160):
-    q = rng.choice([str(rng.randint(1, 50)), f"{rng.randint(1, 9)}x{rng.randint(2, 12)}"])
-    check("parse_qty", q, inventory.parse_qty(q), ref_qty(q))
-for _ in range(160):
-    p = rng.choice([f"{rng.randint(0, 99)}.{rng.randint(0, 99):02d}",
-                    f"{rng.randint(0, 99)}.{rng.randint(0, 9)}", str(rng.randint(1, 99))])
-    check("unit_price_cents", p, inventory.unit_price_cents(p), ref_cents(p))
-for _ in range(80):
-    lines = [(str(rng.randint(1, 9)), f"{rng.randint(1, 30)}.{rng.randint(0, 99):02d}")
-             for _ in range(6)]
-    want = sorted(lines, key=lambda l: ref_qty(l[0]) * ref_cents(l[1]), reverse=True)[:3]
-    check("top_lines", lines, inventory.top_lines(lines, 3), want)
-
+RUNNER_TAIL = r'''
 print()
 for fn, items in fails.items():
     for arg, got, want in items[:2]:
@@ -468,16 +531,102 @@ for fn, items in fails.items():
 sys.exit(1 if fails else 0)
 '''
 
+INVENTORY_CASES = r'''
+def ref_qty(t):
+    t = t.strip()
+    if "x" in t:
+        a, b = t.split("x")
+        return int(a) * int(b)
+    return int(t)
 
-def make_fixture(root):
-    """A 3-bug project whose test log is ~30 KB, so ObservationPack engages."""
+
+def ref_cents(p):
+    e, _, c = p.partition(".")
+    return int(e) * 100 + int((c + "00")[:2]) if c else int(e) * 100
+
+
+for _ in range(160):
+    q = rng.choice([str(rng.randint(1, 50)), f"{rng.randint(1, 9)}x{rng.randint(2, 12)}"])
+    check("parse_qty", q, m.parse_qty(q), ref_qty(q))
+for _ in range(160):
+    p = rng.choice([f"{rng.randint(0, 99)}.{rng.randint(0, 99):02d}",
+                    f"{rng.randint(0, 99)}.{rng.randint(0, 9)}", str(rng.randint(1, 99))])
+    check("unit_price_cents", p, m.unit_price_cents(p), ref_cents(p))
+for _ in range(80):
+    lines = [(str(rng.randint(1, 9)), f"{rng.randint(1, 30)}.{rng.randint(0, 99):02d}")
+             for _ in range(6)]
+    want = sorted(lines, key=lambda l: ref_qty(l[0]) * ref_cents(l[1]), reverse=True)[:3]
+    check("top_lines", lines, m.top_lines(lines, 3), want)
+'''
+
+SCHEDULE_CASES = r'''
+import calendar
+import datetime
+
+for _ in range(140):
+    y = rng.choice([rng.randint(1600, 2400), rng.choice([1700, 1800, 1900, 2000, 2100, 2400])])
+    check("is_leap", y, m.is_leap(y), calendar.isleap(y))
+for _ in range(140):
+    y, mo = rng.randint(1890, 2110), rng.randint(1, 12)
+    check("days_in_month", (y, mo), m.days_in_month(y, mo), calendar.monthrange(y, mo)[1])
+for _ in range(120):
+    d = datetime.date(rng.randint(1890, 2110), rng.randint(1, 12), rng.randint(1, 28))
+    n = rng.randint(0, 400)
+    e = d + datetime.timedelta(days=n)
+    check("add_days", (d.year, d.month, d.day, n), m.add_days(d.year, d.month, d.day, n),
+          (e.year, e.month, e.day))
+'''
+
+TEXTUTIL_CASES = r'''
+import re
+
+WORDS = ["Hello", "world", "DS4", "fast", "C", "inference", "on", "a", "Spark", "2026"]
+SEPS = [" ", "  ", ", ", "! ", " - ", "\n", "\t", "?"]
+
+
+def phrase():
+    out = rng.choice(["", " ", "-", "  "])
+    for _ in range(rng.randint(1, 6)):
+        out += rng.choice(WORDS) + rng.choice(SEPS)
+    return out
+
+
+def ref_slug(t):
+    return re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")
+
+
+def ref_trunc(t, w):
+    return t if len(t) <= w else t[:w - 3] + "..."
+
+
+for _ in range(140):
+    t = phrase()
+    check("slugify", t, m.slugify(t), ref_slug(t))
+for _ in range(140):
+    t = phrase()
+    check("word_count", t, m.word_count(t), len(t.split()))
+for _ in range(120):
+    t, w = phrase(), rng.randint(5, 30)
+    check("truncate", (t, w), m.truncate(t, w), ref_trunc(t, w))
+'''
+
+TASKS = {
+    "inventory": ("inventory.py", INVENTORY, INVENTORY_CASES),
+    "schedule": ("schedule.py", SCHEDULE, SCHEDULE_CASES),
+    "textutil": ("textutil.py", TEXTUTIL, TEXTUTIL_CASES),
+}
+
+
+def make_fixture(root, task="inventory"):
+    """Write task's buggy module and its verbose suite into root."""
+    module, source, cases = TASKS[task]
     os.makedirs(root, exist_ok=True)
-    with open(os.path.join(root, "inventory.py"), "w") as f:
-        f.write(INVENTORY)
+    with open(os.path.join(root, module), "w") as f:
+        f.write(source)
     with open(os.path.join(root, "run_tests.py"), "w") as f:
-        f.write(RUN_TESTS)
+        f.write(RUNNER_HEAD.replace("MODULE", module[:-3]) + cases + RUNNER_TAIL)
     return root
 
 
-def new_workspace(base=None):
-    return make_fixture(tempfile.mkdtemp(prefix="solpi-ws-", dir=base))
+def new_workspace(base=None, task="inventory"):
+    return make_fixture(tempfile.mkdtemp(prefix=f"solpi-{task}-", dir=base), task)

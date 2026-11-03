@@ -23,11 +23,21 @@ bench.py ──► Agent (solpi.py) ──HTTP /v1/chat/completions──► ds4
                └─ per turn: prompt / cached / completion tokens, latency
 ```
 
-- **Task:** a three-bug Python project whose test suite prints about 40 KB per
-  run, with failure examples and a per-function summary at the end. An
-  episode ends when the agent itself sees the suite pass, or after `--turns`
-  model turns. A harness-side oracle would let the baseline skip the
-  validation turn that Action Fusion saves.
+- **Tasks:** three small Python projects, `inventory`, `schedule` and
+  `textutil`, each with three bugs. Each suite prints 30-40 KB per run, with
+  failure examples and a per-function summary at the end. An episode ends
+  when the agent itself sees the suite pass, or after `--turns` model turns.
+  A harness-side oracle would let the baseline skip the validation turn that
+  Action Fusion saves. Commands run without a Python bytecode cache: a fix
+  written in the same second as the previous run, with the same size, would
+  otherwise run stale code.
+- **Modes:** `baseline`, `fusion` (Action Fusion only), `pack`
+  (ObservationPack only) and `solpi` (both). They separate what each
+  mechanism contributes.
+- **Start:** with `--start log` (the default), every episode opens with the
+  failing test output in the task message, full or packed. Every mode must
+  read the failures, and no result hinges on a lucky first fix. With
+  `--start cold`, the agent explores on its own.
 - **Action Fusion:** `write_and_run` writes a file and runs a validation
   command in one tool call.
 - **ObservationPack:** any tool result over 10 KB is archived. The model gets
@@ -54,7 +64,7 @@ so no port needs publishing:
 ```bash
 M=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 sh docker/ds4-docker.sh make
-sh docker/ds4-docker.sh run python3 solpi/bench.py -m "$M" --repeat 3 -- --cuda
+sh docker/ds4-docker.sh run python3 solpi/bench.py -m "$M" -- --cuda
 ```
 
 Native build with a 24 GB GPU and SSD streaming:
@@ -65,6 +75,9 @@ python3 solpi/bench.py -m "$M" -- --cuda --ssd-streaming --ssd-streaming-cache-e
 
 Offline self-test, with no model: `python3 solpi/test_solpi.py`.
 
-Model-driven episodes vary even at temperature 0, because the agent's path
-depends on what it reads. Use `--repeat N` (medians are reported) before
-drawing conclusions.
+The defaults run 12 episodes: four modes on three tasks. Each starts a fresh
+server, so on a Spark the full run takes about 15-20 minutes. ds4 at
+temperature 0 is deterministic, so repeats of the same episode are identical.
+The three tasks provide the variety, and `--repeat N` only reports medians.
+Narrow the run with `--modes` and `--tasks`, e.g.
+`--modes baseline,solpi --tasks schedule`.
