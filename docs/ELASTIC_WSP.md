@@ -162,3 +162,17 @@ fine-tuning that makes the model use them) come from outside.
 stock passes for ratio-0/4/128 layers, the loop policy, the WSP codecs,
 editing and reverting a real private mapping (and checking the file is never
 written), patch scripts, and codebook decoding.
+
+`make test-elastic-model` (Linux, about 4 GB of RAM, 15-20 minutes on 4
+cores) runs the real Flash CPU layer code on a synthetic model. The model has
+the exact Flash shape, passes the production weight binder, and has random
+weights shared by all 43 layers. It checks, bit-exactly:
+
+- `num_loops == 1` against the stock decoder;
+- LAST mode against a reference that rolls back by deep-copying caches,
+  including the final KV state of every layer;
+- PER_LOOP against an unrolled stack with a cache per loop;
+- WSP row masks and scales through the output head, with revert restoring
+  identical logits;
+- session sync/eval with loops, the elastic policy, and a concept step
+  followed by a token step.
