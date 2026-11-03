@@ -72,7 +72,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: test-elastic-wsp metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
+.PHONY: test-elastic-wsp test-elastic-model metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp test-v41-indexer-score
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -1168,6 +1168,16 @@ tests/test_elastic_wsp: tests/test_elastic_wsp.o $(filter-out ds4_cpu.o,$(CPU_CO
 test-elastic-wsp: tests/test_elastic_wsp
 	./tests/test_elastic_wsp
 
+tests/test_elastic_model.o: tests/test_elastic_model.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h ds4_tool_text.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_elastic_model: tests/test_elastic_model.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Synthetic Flash-shaped model in ~4 GB of RAM; Linux (memfd).
+test-elastic-model: tests/test_elastic_model
+	./tests/test_elastic_model
+
 tests/test_session_state_gpu.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1428,7 +1438,7 @@ clean:
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm tests/test_cuda_tokentile
 	rm -f tests/test_ssd_cache tests/test_engram
-	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_elastic_wsp tests/test_tp_commands
+	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_elastic_wsp tests/test_elastic_model tests/test_tp_commands
 	rm -f tests/test_deepseek_indexer
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp tests/test_cuda_tp_link
 	rm -f tests/test_metal_tp_spec
