@@ -352,8 +352,10 @@ class Agent:
         # The episode ends when the agent itself has seen the suite pass: a
         # harness-side oracle would let the baseline skip the validation turn
         # that Action Fusion exists to save.
+        # The suite's own summary decides, not the exit code: `run_tests.py |
+        # tail` exits 0 even when the suite fails.
         if name in ("run", "write_and_run") and "run_tests" in str(args.get("command", "")) \
-                and out.rstrip().endswith("[exit 0]"):
+                and re.search(r"SUMMARY: \d+ cases, 0 failures", out):
             self.passed_seen = True
         return self._deliver(name, out)
 

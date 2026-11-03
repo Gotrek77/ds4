@@ -113,6 +113,14 @@ def main():
         ws.write(module, fixed(task))
         assert ws.run(TEST).rstrip().endswith("[exit 0]"), task
 
+    # A piped run exits 0 although the suite fails: it must not end the episode.
+    a = solpi.Agent("http://unused", solpi.new_workspace(tmp, "inventory"), "inventory.py")
+    a.observe("run", {"command": "python3 run_tests.py | tail -3"})
+    assert not a.passed_seen
+    a.ws.write("inventory.py", fixed("inventory"))
+    a.observe("run", {"command": "python3 run_tests.py | tail -3"})
+    assert a.passed_seen
+
     for start in ("cold", "log"):
         results = {}
         for task, (module, _, _) in solpi.TASKS.items():
