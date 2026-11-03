@@ -128,6 +128,46 @@ typedef struct {
     int debug_hash;             /* cross-check hidden state every N tokens */
 } ds4_tp_options;
 
+/* Elastic looped decoding.
+ *
+ * The layer stack is split in three sections:
+ *
+ *     [0, rec_start)          input block, run once
+ *     [rec_start, rec_end)    recurrent block, run num_loops times
+ *     [rec_end, n_layer)      output block, run once
+ *
+ * The recurrent block re-applies the same weights to its own output, so the
+ * model gets more depth at inference time without more parameters.  With
+ * num_loops == 1 the schedule is exactly the stock model.
+ *
+ * Each recurrent layer pass writes one KV row for the current position, so a
+ * looped schedule must decide which pass owns the cache:
+ *
+ * LAST:     one cache per layer, as in the stock model.  Earlier passes attend
+ *           to the history plus their own provisional row, which is rolled
+ *           back; only the final pass commits.  No extra memory, and
+ *           num_loops can change at any token without a rebuild.
+ * PER_LOOP: loop k > 0 owns a private cache per recurrent layer, so every
+ *           pass attends to the history produced by the same pass.  Costs
+ *           (num_loops-1) * |recurrent block| extra layer caches.  Lowering
+ *           num_loops is free; raising it past the levels that saw the whole
+ *           history invalidates the checkpoint and the next sync rebuilds.
+ *
+ * Looped schedules are implemented by the CPU reference backend. */
+typedef enum {
+    DS4_LOOP_KV_LAST = 0,
+    DS4_LOOP_KV_PER_LOOP = 1,
+} ds4_loop_kv_mode;
+
+#define DS4_LOOP_MAX 64
+
+typedef struct {
+    uint32_t rec_start;
+    uint32_t rec_end;
+    uint32_t num_loops;         /* 0 or 1: stock model */
+    ds4_loop_kv_mode kv_mode;
+} ds4_loop_config;
+
 typedef struct {
     const char *model_path;
     const char *mtp_path;
@@ -176,6 +216,10 @@ typedef struct {
     bool load_output;
     ds4_distributed_options distributed;
     ds4_tp_options tp;
+    /* Default loop schedule for new sessions (CPU backend). */
+    ds4_loop_config loop;
+    /* Weight-space patch script applied after load (CPU backend). */
+    const char *wsp_script;
 } ds4_engine_options;
 
 typedef struct {
@@ -411,6 +455,147 @@ float ds4_session_directional_steering_ffn(ds4_session *s);
 /* Change steering for future evaluation without rebuilding the existing KV
  * state. Live changes are currently limited to non-distributed sessions. */
 int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale);
+
+/* Elastic loops, see ds4_loop_config.  Returns 0 on success.  A change that
+ * makes the live KV state inconsistent with the new schedule invalidates the
+ * checkpoint, so the next ds4_session_sync() rebuilds it. */
+int ds4_loop_config_check(const ds4_loop_config *cfg, int n_layer,
+                          char *err, size_t errlen);
+int ds4_session_set_loops(ds4_session *s, const ds4_loop_config *cfg,
+                          char *err, size_t errlen);
+ds4_loop_config ds4_session_loops(ds4_session *s);
+
+/* Weight-Space Programming: inspect and edit the loaded weights in place.
+ *
+ * Every tensor is seen as a row-major matrix: cols is GGUF dim[0] (the input
+ * features of a matvec, contiguous in memory) and rows is everything else, so
+ * an expert tensor [cols, out, n_expert] has rows = out * n_expert and expert
+ * e owns rows [e*out, (e+1)*out).
+ *
+ * Edits are copy-on-write pages of the private model mapping: the GGUF file
+ * is never written, and ds4_wsp_revert() re-reads the original bytes from it.
+ * F32, F16, BF16 and Q8_0 support every operation (Q8_0 blocks are
+ * requantized only where they changed); other quantized types support only
+ * zeroing whole rows.  Live sessions keep the KV state computed with the old
+ * weights until they are invalidated or rebuilt.  Callers must not edit
+ * while a session of the same engine is evaluating. */
+typedef struct {
+    char name[96];
+    const char *type_name;
+    uint32_t type;              /* GGUF tensor type id */
+    uint32_t ndim;
+    uint64_t dim[4];
+    uint64_t rows;
+    uint64_t cols;
+    uint64_t bytes;
+    bool editable;              /* element access: f32/f16/bf16/q8_0 */
+    bool dirty;                 /* differs from the GGUF file */
+} ds4_wsp_tensor;
+
+typedef enum {
+    DS4_WSP_ROWS = 0,
+    DS4_WSP_COLS = 1,
+} ds4_wsp_axis;
+
+int ds4_wsp_tensor_count(ds4_engine *e);
+int ds4_wsp_find(ds4_engine *e, const char *name);
+int ds4_wsp_info(ds4_engine *e, int tensor, ds4_wsp_tensor *out);
+/* Dequantize / requantize one row of cols floats. */
+int ds4_wsp_read_row(ds4_engine *e, int tensor, uint64_t row, float *out,
+                     char *err, size_t errlen);
+int ds4_wsp_write_row(ds4_engine *e, int tensor, uint64_t row, const float *in,
+                      char *err, size_t errlen);
+/* Multiply rows or columns [first, first+count) by factor.  A factor of 0 is
+ * a mask (ablation), and is also accepted on whole rows of any block type. */
+int ds4_wsp_scale(ds4_engine *e, int tensor, ds4_wsp_axis axis,
+                  uint64_t first, uint64_t count, float factor,
+                  char *err, size_t errlen);
+/* Replace the whole tensor with a closed-form rows x cols f32 matrix. */
+int ds4_wsp_load_matrix(ds4_engine *e, int tensor, const float *m,
+                        uint64_t rows, uint64_t cols, char *err, size_t errlen);
+/* Same, reading raw little-endian f32 from a file. */
+int ds4_wsp_load_file(ds4_engine *e, int tensor, const char *path,
+                      char *err, size_t errlen);
+int ds4_wsp_revert(ds4_engine *e, int tensor, char *err, size_t errlen);
+int ds4_wsp_revert_all(ds4_engine *e, char *err, size_t errlen);
+uint64_t ds4_wsp_dirty_bytes(ds4_engine *e);
+/* Apply a line-oriented patch script, see gguf-tools/wsp.py:
+ *
+ *     scale  <tensor> rows|cols <ranges> <factor>
+ *     mask   <tensor> rows|cols <ranges>
+ *     load   <tensor> <file.f32>
+ *     revert <tensor>|*
+ *
+ * <ranges> is a comma list of N or A-B (inclusive).  Relative file paths are
+ * resolved against the script directory.  Stops at the first error. */
+int ds4_wsp_apply_script(ds4_engine *e, const char *path, char *err, size_t errlen);
+
+/* Coarse-to-fine multi-level decoding (Next Concept Modeling).
+ *
+ * A ds4_mlc holds L codebooks over the model's hidden space.  Decoding a
+ * hidden vector h is residual quantization from the coarsest level down:
+ *
+ *     r_0 = h;  c_l = sample_k(<codebook_l[k], r_l> / T);  r_{l+1} = r_l - codebook_l[c_l]
+ *
+ * and the concept vector is sum_l codebook_l[c_l].  Truncating at fewer
+ * levels gives a coarser concept.  A decode step can then emit either a token
+ * (classic sampling) or a concept, whose vector is fed back as the input
+ * embedding of the next position. */
+#define DS4_MLC_MAX_LEVELS 16
+
+typedef struct ds4_mlc ds4_mlc;
+
+/* File: "DS4C", u32 version=1, u32 levels, u32 dim, then per level u32 K and
+ * K*dim f32 rows, all little-endian. */
+int ds4_mlc_open(ds4_mlc **out, const char *path, char *err, size_t errlen);
+void ds4_mlc_free(ds4_mlc *m);
+int ds4_mlc_levels(const ds4_mlc *m);
+int ds4_mlc_dim(const ds4_mlc *m);
+/* Decode max_levels (<= levels) codes from hidden.  temperature <= 0 is
+ * argmax.  concept, when not NULL, receives the dim-wide concept vector. */
+int ds4_mlc_decode(const ds4_mlc *m, const float *hidden, int max_levels,
+                   float temperature, uint64_t *rng, int *codes, float *concept);
+/* Rebuild the concept vector from codes. */
+int ds4_mlc_concept(const ds4_mlc *m, const int *codes, int levels, float *concept);
+
+/* Final normalized hidden state (the output head input) of the last
+ * evaluated position.  CPU backend only; returns floats copied or -1. */
+int ds4_session_hidden(ds4_session *s, float *out, int cap);
+/* Evaluate the next position from an input embedding instead of a token.
+ * token_tag is recorded in the checkpoint and used by token-routed layers;
+ * a later rebuild replays it as an ordinary token, so concept positions are
+ * live-only state and sessions containing them refuse disk payload saves. */
+int ds4_session_eval_embedding(ds4_session *s, const float *embd, int token_tag,
+                               char *err, size_t errlen);
+
+typedef enum {
+    DS4_STEP_TOKEN = 0,
+    DS4_STEP_CONCEPT = 1,
+} ds4_step_kind;
+
+typedef struct {
+    ds4_step_kind kind;
+    int token;                  /* sampled token, or the concept token_tag */
+    int levels;
+    int codes[DS4_MLC_MAX_LEVELS];
+} ds4_step;
+
+typedef struct {
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+    uint64_t *rng;
+    const ds4_mlc *mlc;         /* NULL: token step */
+    int mlc_levels;             /* 0: all levels */
+    int concept_tag;            /* token_tag for concept steps */
+} ds4_step_options;
+
+/* One decode step from the current logits/hidden state: choose the next unit
+ * (token or concept), evaluate it, and report what was emitted. */
+int ds4_session_step(ds4_session *s, const ds4_step_options *opt, ds4_step *out,
+                     char *err, size_t errlen);
+
 bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;

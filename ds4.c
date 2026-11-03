@@ -2406,6 +2406,9 @@ typedef struct ds4_model {
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
+    /* MAP_PRIVATE: pages can be made writable copy-on-write for WSP edits
+     * without ever touching the file. */
+    bool private_map;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -2885,6 +2888,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->map = map;
     m->size = (uint64_t)st.st_size;
     m->file_size = m->size;
+    m->private_map = mmap_flags == MAP_PRIVATE;
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -14282,6 +14286,12 @@ static void output_logits_one(
         const ds4_model   * model,
         const ds4_weights * weights,
         const float       * inp_hc);
+static void output_logits_one_hidden(
+        float             * logits,
+        float             * hidden,
+        const ds4_model   * model,
+        const ds4_weights * weights,
+        const float       * inp_hc);
 
 /* =========================================================================
  * KV Cache, Compressors, and CPU Layer Execution.
@@ -14496,61 +14506,74 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     memset(scratch, 0, sizeof(*scratch));
 }
 
-/* Allocate per-layer KV state: a raw sliding window for all layers, plus
- * compressed attention/indexer caches for layers whose ratio is nonzero. */
-static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap) {
-    memset(cache, 0, sizeof(*cache));
+/* Allocate one layer's KV state: a raw sliding window, plus compressed
+ * attention/indexer caches when the layer's ratio is nonzero.  Looped
+ * decoding allocates extra per-loop copies of recurrent layers through this
+ * same function, so they always match the stock layout. */
+static void layer_cache_init(ds4_layer_cache *lc, uint32_t il,
+                             uint32_t ctx_size, uint32_t raw_cap) {
+    memset(lc, 0, sizeof(*lc));
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    lc->cap_raw = raw_cap;
+    lc->raw_kv = xmalloc_zeroed((size_t)raw_cap * DS4_N_HEAD_DIM, sizeof(float));
+    lc->compress_ratio = ratio;
+    if (ratio == 0) return;
+
+    const uint32_t coff = ratio == 4 ? 2u : 1u;
+    const uint32_t comp_cap = ctx_size / ratio + 2;
+    const uint32_t attn_width = coff * DS4_N_HEAD_DIM;
+    const uint32_t attn_rows = coff * ratio;
+
+    lc->comp_cap = comp_cap;
+    lc->attn_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
+    lc->attn_state_kv = xmalloc_zeroed((size_t)attn_width * attn_rows, sizeof(float));
+    lc->attn_state_score = xmalloc((size_t)attn_width * attn_rows * sizeof(float));
+    for (uint64_t i = 0; i < (uint64_t)attn_width * attn_rows; i++) {
+        lc->attn_state_score[i] = DS4_NEG_INF;
+    }
+
+    if (ratio == 4) {
+        const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
+        const uint32_t index_rows = coff * ratio;
+        lc->index_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_INDEXER_HEAD_DIM, sizeof(float));
+        lc->index_state_kv = xmalloc_zeroed((size_t)index_width * index_rows, sizeof(float));
+        lc->index_state_score = xmalloc((size_t)index_width * index_rows * sizeof(float));
+        for (uint64_t i = 0; i < (uint64_t)index_width * index_rows; i++) {
+            lc->index_state_score[i] = DS4_NEG_INF;
+        }
+    }
+}
+
+static void layer_cache_free(ds4_layer_cache *lc) {
+    free(lc->raw_kv);
+    free(lc->attn_comp_kv);
+    free(lc->attn_state_kv);
+    free(lc->attn_state_score);
+    free(lc->index_comp_kv);
+    free(lc->index_state_kv);
+    free(lc->index_state_score);
+    memset(lc, 0, sizeof(*lc));
+}
+
+static uint32_t kv_cache_raw_cap(uint32_t ctx_size, uint32_t raw_cap) {
     if (raw_cap == 0) raw_cap = ds4_default_raw_cap(ctx_size);
     if (raw_cap > ctx_size) raw_cap = ctx_size;
     if (raw_cap == 0) raw_cap = 1;
+    return raw_cap;
+}
 
+static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap) {
+    memset(cache, 0, sizeof(*cache));
+    raw_cap = kv_cache_raw_cap(ctx_size, raw_cap);
     cache->head_dim = DS4_N_HEAD_DIM;
-
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        cache->layer[il].cap_raw = raw_cap;
-        cache->layer[il].raw_kv = xmalloc_zeroed((size_t)raw_cap * DS4_N_HEAD_DIM, sizeof(float));
-        cache->layer[il].compress_ratio = ratio;
-
-        if (ratio != 0) {
-            const uint32_t coff = ratio == 4 ? 2u : 1u;
-            const uint32_t comp_cap = ctx_size / ratio + 2;
-            const uint32_t attn_width = coff * DS4_N_HEAD_DIM;
-            const uint32_t attn_rows = coff * ratio;
-
-            cache->layer[il].comp_cap = comp_cap;
-            cache->layer[il].attn_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
-            cache->layer[il].attn_state_kv = xmalloc_zeroed((size_t)attn_width * attn_rows, sizeof(float));
-            cache->layer[il].attn_state_score = xmalloc((size_t)attn_width * attn_rows * sizeof(float));
-            for (uint64_t i = 0; i < (uint64_t)attn_width * attn_rows; i++) {
-                cache->layer[il].attn_state_score[i] = DS4_NEG_INF;
-            }
-
-            if (ratio == 4) {
-                const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
-                const uint32_t index_rows = coff * ratio;
-                cache->layer[il].index_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_INDEXER_HEAD_DIM, sizeof(float));
-                cache->layer[il].index_state_kv = xmalloc_zeroed((size_t)index_width * index_rows, sizeof(float));
-                cache->layer[il].index_state_score = xmalloc((size_t)index_width * index_rows * sizeof(float));
-                for (uint64_t i = 0; i < (uint64_t)index_width * index_rows; i++) {
-                    cache->layer[il].index_state_score[i] = DS4_NEG_INF;
-                }
-            }
-        }
+        layer_cache_init(&cache->layer[il], il, ctx_size, raw_cap);
     }
 }
 
 static void kv_cache_free(ds4_kv_cache *cache) {
     if (!cache) return;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        free(cache->layer[il].raw_kv);
-        free(cache->layer[il].attn_comp_kv);
-        free(cache->layer[il].attn_state_kv);
-        free(cache->layer[il].attn_state_score);
-        free(cache->layer[il].index_comp_kv);
-        free(cache->layer[il].index_state_kv);
-        free(cache->layer[il].index_state_score);
-    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) layer_cache_free(&cache->layer[il]);
     memset(cache, 0, sizeof(*cache));
 }
 
@@ -15903,6 +15926,264 @@ static void forward_token_raw_swa_cpu_decode_scratch(
     }
 }
 
+/* =========================================================================
+ * Elastic Looped Decoding (CPU reference).
+ * =========================================================================
+ *
+ * The stock decode runs layers 0..L-1 once.  A looped schedule runs the
+ * input block [0,a) once, the recurrent block [a,b) num_loops times feeding
+ * its output back to its input, and the output block [b,L) once:
+ *
+ *     embd -> [0,a) -> ( [a,b) )^N -> [b,L) -> head
+ *
+ * The HC residual stream has the same shape at every layer boundary, so
+ * looping needs no adapter: layer b-1's output is a valid input for layer a.
+ * The only real question is KV ownership, since every pass of a recurrent
+ * layer produces a KV row for the same position (see ds4_loop_kv_mode).
+ */
+
+/* Everything one decode pass mutates in a layer cache.  A pass appends one
+ * raw row (sliding the window when full), updates the compressor states, and
+ * may append one compressed row.  Restoring the counters, the compressor
+ * states and the raw row dropped by the slide undoes the pass exactly. */
+typedef struct {
+    uint32_t n_raw;
+    uint32_t n_comp;
+    uint32_t n_index_comp;
+    float *raw_row0;
+    float *attn_state_kv;
+    float *attn_state_score;
+    float *index_state_kv;
+    float *index_state_score;
+    uint64_t attn_cap;
+    uint64_t index_cap;
+} ds4_layer_cache_mark;
+
+typedef struct {
+    ds4_loop_config cfg;        /* normalized: 1 <= num_loops <= DS4_LOOP_MAX */
+    uint32_t levels;            /* loop levels with a cache; level 0 is the main cache */
+    uint32_t synced;            /* levels whose caches hold the whole checkpoint */
+    uint32_t ctx_size;
+    ds4_layer_cache *extra;     /* (levels-1) x (rec_end-rec_start), per-loop mode */
+    ds4_layer_cache_mark mark;
+} ds4_loop_state;
+
+static uint64_t layer_cache_state_floats(uint32_t ratio, uint32_t head_dim) {
+    if (ratio == 0) return 0;
+    const uint32_t coff = ratio == 4 ? 2u : 1u;
+    return (uint64_t)coff * head_dim * coff * ratio;
+}
+
+static void layer_cache_mark_save(ds4_layer_cache_mark *m, const ds4_layer_cache *lc) {
+    const uint32_t ratio = lc->compress_ratio;
+    const uint64_t attn = layer_cache_state_floats(ratio, DS4_N_HEAD_DIM);
+    const uint64_t index = ratio == 4 ? layer_cache_state_floats(ratio, DS4_N_INDEXER_HEAD_DIM) : 0;
+
+    if (!m->raw_row0) m->raw_row0 = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
+    if (attn > m->attn_cap) {
+        m->attn_state_kv = xrealloc(m->attn_state_kv, (size_t)attn * sizeof(float));
+        m->attn_state_score = xrealloc(m->attn_state_score, (size_t)attn * sizeof(float));
+        m->attn_cap = attn;
+    }
+    if (index > m->index_cap) {
+        m->index_state_kv = xrealloc(m->index_state_kv, (size_t)index * sizeof(float));
+        m->index_state_score = xrealloc(m->index_state_score, (size_t)index * sizeof(float));
+        m->index_cap = index;
+    }
+
+    m->n_raw = lc->n_raw;
+    m->n_comp = lc->n_comp;
+    m->n_index_comp = lc->n_index_comp;
+    /* Only a full window slides, losing its oldest row. */
+    if (lc->n_raw == lc->cap_raw) {
+        memcpy(m->raw_row0, lc->raw_kv, (size_t)DS4_N_HEAD_DIM * sizeof(float));
+    }
+    if (attn) {
+        memcpy(m->attn_state_kv, lc->attn_state_kv, (size_t)attn * sizeof(float));
+        memcpy(m->attn_state_score, lc->attn_state_score, (size_t)attn * sizeof(float));
+    }
+    if (index) {
+        memcpy(m->index_state_kv, lc->index_state_kv, (size_t)index * sizeof(float));
+        memcpy(m->index_state_score, lc->index_state_score, (size_t)index * sizeof(float));
+    }
+}
+
+static void layer_cache_mark_restore(const ds4_layer_cache_mark *m, ds4_layer_cache *lc) {
+    const uint32_t ratio = lc->compress_ratio;
+    const uint64_t attn = layer_cache_state_floats(ratio, DS4_N_HEAD_DIM);
+    const uint64_t index = ratio == 4 ? layer_cache_state_floats(ratio, DS4_N_INDEXER_HEAD_DIM) : 0;
+
+    if (m->n_raw == lc->cap_raw) {
+        memmove(lc->raw_kv + DS4_N_HEAD_DIM, lc->raw_kv,
+                (size_t)(lc->cap_raw - 1) * DS4_N_HEAD_DIM * sizeof(float));
+        memcpy(lc->raw_kv, m->raw_row0, (size_t)DS4_N_HEAD_DIM * sizeof(float));
+    }
+    lc->n_raw = m->n_raw;
+    /* Compressed rows are append-only: rows past the count are never read. */
+    lc->n_comp = m->n_comp;
+    lc->n_index_comp = m->n_index_comp;
+    if (attn) {
+        memcpy(lc->attn_state_kv, m->attn_state_kv, (size_t)attn * sizeof(float));
+        memcpy(lc->attn_state_score, m->attn_state_score, (size_t)attn * sizeof(float));
+    }
+    if (index) {
+        memcpy(lc->index_state_kv, m->index_state_kv, (size_t)index * sizeof(float));
+        memcpy(lc->index_state_score, m->index_state_score, (size_t)index * sizeof(float));
+    }
+}
+
+static void layer_cache_mark_free(ds4_layer_cache_mark *m) {
+    free(m->raw_row0);
+    free(m->attn_state_kv);
+    free(m->attn_state_score);
+    free(m->index_state_kv);
+    free(m->index_state_score);
+    memset(m, 0, sizeof(*m));
+}
+
+static bool loop_state_active(const ds4_loop_state *ls) {
+    return ls && ls->cfg.num_loops > 1 && ls->cfg.rec_start < ls->cfg.rec_end;
+}
+
+static uint32_t loop_state_rec_layers(const ds4_loop_state *ls) {
+    return ls->cfg.rec_end - ls->cfg.rec_start;
+}
+
+static void loop_state_free_extra(ds4_loop_state *ls) {
+    if (ls->extra) {
+        const uint64_t n = (uint64_t)(ls->levels - 1) * loop_state_rec_layers(ls);
+        for (uint64_t i = 0; i < n; i++) layer_cache_free(&ls->extra[i]);
+        free(ls->extra);
+    }
+    ls->extra = NULL;
+    ls->levels = 1;
+}
+
+static void loop_state_free(ds4_loop_state *ls) {
+    loop_state_free_extra(ls);
+    layer_cache_mark_free(&ls->mark);
+}
+
+/* Make sure every level up to num_loops has a cache.  Existing levels keep
+ * their history; new levels start empty, so they are synced only when the
+ * checkpoint is empty too. */
+static void loop_state_reserve(ds4_loop_state *ls, uint32_t checkpoint_len) {
+    if (ls->cfg.kv_mode != DS4_LOOP_KV_PER_LOOP || !loop_state_active(ls)) return;
+    const uint32_t want = ls->cfg.num_loops;
+    if (want <= ls->levels) return;
+
+    const uint32_t n_rec = loop_state_rec_layers(ls);
+    const uint32_t raw_cap = kv_cache_raw_cap(ls->ctx_size, 0);
+    ls->extra = xrealloc(ls->extra, (size_t)(want - 1) * n_rec * sizeof(ls->extra[0]));
+    for (uint32_t lv = ls->levels; lv < want; lv++) {
+        for (uint32_t r = 0; r < n_rec; r++) {
+            layer_cache_init(&ls->extra[(uint64_t)(lv - 1) * n_rec + r],
+                             ls->cfg.rec_start + r, ls->ctx_size, raw_cap);
+        }
+    }
+    ls->levels = want;
+    if (checkpoint_len == 0) ls->synced = want;
+}
+
+/* Empty every per-loop cache, matching a freshly reset main cache.  The
+ * extra caches always belong to the current recurrent range: set_loops frees
+ * them before changing it. */
+static void loop_state_reset(ds4_loop_state *ls) {
+    if (ls->extra) {
+        const uint32_t n_rec = loop_state_rec_layers(ls);
+        const uint32_t raw_cap = kv_cache_raw_cap(ls->ctx_size, 0);
+        const uint64_t n = (uint64_t)(ls->levels - 1) * n_rec;
+        for (uint64_t i = 0; i < n; i++) {
+            layer_cache_free(&ls->extra[i]);
+            layer_cache_init(&ls->extra[i], ls->cfg.rec_start + (uint32_t)(i % n_rec),
+                             ls->ctx_size, raw_cap);
+        }
+    }
+    ls->synced = ls->levels;
+}
+
+/* Loop levels at or above num_loops did not see the position just decoded,
+ * so in per-loop mode they no longer hold the whole history. */
+static void loop_state_note_position(ds4_loop_state *ls) {
+    const uint32_t ran = loop_state_active(ls) ? ls->cfg.num_loops : 1;
+    if (ls->synced > ran) ls->synced = ran;
+}
+
+static ds4_layer_cache *loop_layer_cache(ds4_kv_cache *cache, ds4_loop_state *ls,
+                                         uint32_t loop, uint32_t il) {
+    if (loop == 0 || ls->cfg.kv_mode != DS4_LOOP_KV_PER_LOOP) return &cache->layer[il];
+    const uint32_t n_rec = loop_state_rec_layers(ls);
+    return &ls->extra[(uint64_t)(loop - 1) * n_rec + (il - ls->cfg.rec_start)];
+}
+
+/* One decode position through the looped schedule.  embd, when not NULL,
+ * replaces the token embedding (concept steps); token is still passed to the
+ * layers because hash-routed MoE layers select experts by token id.  With
+ * ls == NULL or num_loops == 1 this performs exactly the stock sequence of
+ * forward_token_raw_swa_cpu_decode_scratch(). */
+static void forward_token_looped_cpu(
+        float             * logits,
+        const ds4_model   * model,
+        const ds4_weights * weights,
+        ds4_kv_cache      * cache,
+        ds4_loop_state    * ls,
+        int                 token,
+        const float       * embd,
+        uint32_t            pos,
+        const float       * steering_dirs,
+        float               steering_attn_scale,
+        float               steering_ffn_scale,
+        ds4_cpu_decode_scratch * scratch) {
+    const bool looped = loop_state_active(ls);
+    const uint32_t a = looped ? ls->cfg.rec_start : 0;
+    const uint32_t b = looped ? ls->cfg.rec_end : 0;
+    const uint32_t n_loops = looped ? ls->cfg.num_loops : 1;
+    const bool last_only = looped && ls->cfg.kv_mode == DS4_LOOP_KV_LAST;
+    float *cur = scratch->cur;
+    float *next = scratch->next;
+
+    if (embd) {
+        memcpy(scratch->plain, embd, (size_t)DS4_N_EMBD * sizeof(float));
+    } else {
+        embed_token_f16(model, weights, token, scratch->plain);
+    }
+    hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
+
+/* Run layer IL on cur against cache LC, then make its output the new cur. */
+#define LOOP_LAYER(IL, LC) do { \
+        layer_forward_raw_swa_one(next, model, &weights->layer[(IL)], (LC), \
+                                  cur, (IL), pos, token, steering_dirs, \
+                                  steering_attn_scale, steering_ffn_scale, \
+                                  scratch); \
+        float *tmp_ = cur; cur = next; next = tmp_; \
+    } while (0)
+
+    /* Input block. */
+    for (uint32_t il = 0; il < a; il++) LOOP_LAYER(il, &cache->layer[il]);
+
+    /* Recurrent block.  In LAST mode the provisional passes see their own
+     * row (attention over the current position is part of the layer) and
+     * then roll it back, so the cache ends up holding only the final pass,
+     * exactly the row layout of the stock model. */
+    for (uint32_t loop = 0; loop < n_loops && a < b; loop++) {
+        const bool provisional = last_only && loop + 1 < n_loops;
+        for (uint32_t il = a; il < b; il++) {
+            ds4_layer_cache *lc = loop_layer_cache(cache, ls, loop, il);
+            if (provisional) layer_cache_mark_save(&ls->mark, lc);
+            LOOP_LAYER(il, lc);
+            if (provisional) layer_cache_mark_restore(&ls->mark, lc);
+        }
+    }
+
+    /* Output block: every layer when the schedule is not looped. */
+    for (uint32_t il = b; il < DS4_N_LAYER; il++) LOOP_LAYER(il, &cache->layer[il]);
+#undef LOOP_LAYER
+
+    if (logits) {
+        output_logits_one_decode_scratch(logits, model, weights, cur, scratch);
+    }
+}
+
 #ifndef DS4_NO_GPU
 static void forward_token_raw_swa_cpu(
         float             * logits,
@@ -15931,6 +16212,7 @@ static void forward_token_raw_swa_cpu(
  * then layer 1, etc., which exposes batch matmul opportunities. */
 static void prefill_layer_major_cpu(
         float             * logits,
+        float             * hidden,
         const ds4_model   * model,
         const ds4_weights * weights,
         ds4_kv_cache      * cache,
@@ -16080,7 +16362,7 @@ static void prefill_layer_major_cpu(
     kv_cache_finish_prefill_states(cache, (uint32_t)n_tok);
 
     if (logits) {
-        output_logits_one(logits, model, weights, cur + (n_tok - 1) * hc_dim);
+        output_logits_one_hidden(logits, hidden, model, weights, cur + (n_tok - 1) * hc_dim);
     }
 
     if (decode_scratch_ready) cpu_decode_scratch_free(&decode_scratch);
@@ -16202,8 +16484,10 @@ static void output_hc_head_one(
 }
 
 /* Final language-model head: HC collapse, RMSNorm, and Q8_0 vocab projection. */
-static void output_logits_one(
+/* hidden, when not NULL, receives the normalized head input (N_EMBD). */
+static void output_logits_one_hidden(
         float             * logits,
+        float             * hidden,
         const ds4_model   * model,
         const ds4_weights * weights,
         const float       * inp_hc) {
@@ -16214,9 +16498,18 @@ static void output_logits_one(
     rms_norm_weight(norm, embd, tensor_data(model, weights->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
 
     matvec_q8_0(logits, model, weights->output, norm);
+    if (hidden) memcpy(hidden, norm, (size_t)DS4_N_EMBD * sizeof(norm[0]));
 
     free(norm);
     free(embd);
+}
+
+static void output_logits_one(
+        float             * logits,
+        const ds4_model   * model,
+        const ds4_weights * weights,
+        const float       * inp_hc) {
+    output_logits_one_hidden(logits, NULL, model, weights, inp_hc);
 }
 
 static void layer_glm_first_token_attention_one(
@@ -44385,6 +44678,9 @@ struct ds4_engine {
     float mtp_margin;
     float dspark_confidence_threshold;
     bool dspark_confidence_threshold_set;
+    ds4_loop_config loop_default;
+    uint64_t *wsp_lo;           /* per tensor dirty byte span, NULL until first edit */
+    uint64_t *wsp_hi;
     char *directional_steering_file;
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
@@ -46948,7 +47244,7 @@ static int generate_raw_swa_cpu(
         return 1;
     }
 
-    prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
+    prefill_layer_major_cpu(logits, NULL, model, weights, &cache, prompt,
                             directional_steering_dirs,
                             directional_steering_attn,
                             directional_steering_ffn);
@@ -62455,6 +62751,11 @@ struct ds4_session {
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
+    ds4_loop_state loop;
+    /* cpu_scratch.output_norm holds the last position's final hidden state. */
+    bool hidden_valid;
+    /* Some checkpoint positions were evaluated from concept embeddings. */
+    bool has_concepts;
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
@@ -63577,6 +63878,35 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
 static void session_cpu_reset_cache(ds4_session *s) {
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
+    loop_state_reset(&s->loop);
+    s->hidden_valid = false;
+    s->has_concepts = false;
+}
+
+/* Evaluate the next checkpoint position on the CPU backend.  The stock
+ * schedule keeps calling the original decode function, so sessions that never
+ * enable loops or concept steps run exactly the code they always did. */
+static void session_cpu_forward(ds4_session *s, int token, const float *embd) {
+    ds4_engine *e = s->engine;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    if (!embd && !loop_state_active(&s->loop)) {
+        forward_token_raw_swa_cpu_decode_scratch(s->logits, &e->model, &e->weights,
+                                                 &s->cpu_cache, token, pos,
+                                                 e->directional_steering_dirs,
+                                                 e->directional_steering_attn_scale,
+                                                 e->directional_steering_ffn_scale,
+                                                 &s->cpu_scratch);
+    } else {
+        forward_token_looped_cpu(s->logits, &e->model, &e->weights,
+                                 &s->cpu_cache, &s->loop, token, embd, pos,
+                                 e->directional_steering_dirs,
+                                 e->directional_steering_attn_scale,
+                                 e->directional_steering_ffn_scale,
+                                 &s->cpu_scratch);
+    }
+    loop_state_note_position(&s->loop);
+    s->hidden_valid = true;
+    if (embd) s->has_concepts = true;
 }
 
 static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_end) {
@@ -65130,9 +65460,25 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 }
 #endif
 
+/* Payloads (disk KV cache, snapshots) are keyed by tokens and restored into
+ * any session of the same model, so they must describe the stock model's
+ * state.  Looped schedules, concept positions and edited weights all produce
+ * KV rows that a stock session would silently misread. */
+static const char *session_payload_blocker(ds4_session *s) {
+    if (s->loop.cfg.num_loops > 1) return "looped sessions cannot be serialized";
+    if (s->has_concepts) return "sessions with concept positions cannot be serialized";
+    if (ds4_wsp_dirty_bytes(s->engine) != 0) return "sessions over edited weights cannot be serialized";
+    return NULL;
+}
+
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
+        return 1;
+    }
+    const char *blocker = session_payload_blocker(s);
+    if (blocker) {
+        payload_set_err(err, errlen, blocker);
         return 1;
     }
     if (s->distributed) {
@@ -65482,6 +65828,12 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (s && s->engine &&
+        (s->loop.cfg.num_loops > 1 || ds4_wsp_dirty_bytes(s->engine) != 0)) {
+        payload_set_err(err, errlen, "stock payloads cannot be loaded into looped "
+                                     "sessions or over edited weights");
+        return 1;
+    }
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -72970,14 +73322,37 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
+/* Elastic loops and weight patches need the loaded shape and weights, so
+ * they are validated and applied once the engine is fully open. */
+static int ds4_engine_open_extensions(ds4_engine **out, const ds4_engine_options *opt, int rc) {
+    if (rc != 0 || !*out || !opt) return rc;
+    ds4_engine *e = *out;
+    char err[512] = {0};
+    if (opt->loop.num_loops > 1 && e->backend != DS4_BACKEND_CPU) {
+        snprintf(err, sizeof(err), "looped schedules require the CPU backend");
+    } else if (ds4_loop_config_check(&opt->loop, DS4_N_LAYER, err, sizeof(err)) == 0) {
+        e->loop_default = opt->loop;
+        if (opt->wsp_script && opt->wsp_script[0] &&
+            ds4_wsp_apply_script(e, opt->wsp_script, err, sizeof(err)) == 0) {
+            fprintf(stderr, "ds4: applied weight patch %s (%.2f MiB edited)\n",
+                    opt->wsp_script, (double)ds4_wsp_dirty_bytes(e) / (1024.0 * 1024.0));
+        }
+    }
+    if (!err[0]) return 0;
+    fprintf(stderr, "ds4: %s\n", err);
+    ds4_engine_close(e);
+    *out = NULL;
+    return 1;
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    return ds4_engine_open_internal(out, opt, NULL);
+    return ds4_engine_open_extensions(out, opt, ds4_engine_open_internal(out, opt, NULL));
 }
 
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
-    return ds4_engine_open_internal(out, opt, gpu_cfg);
+    return ds4_engine_open_extensions(out, opt, ds4_engine_open_internal(out, opt, gpu_cfg));
 }
 
 static int ds4_engine_open_internal(ds4_engine **out,
@@ -75362,6 +75737,8 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
+    free(e->wsp_lo);
+    free(e->wsp_hi);
     free(e->model_path);
     free(e);
 }
@@ -75525,6 +75902,15 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                      e->prefill_chunk);
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        s->loop.cfg.num_loops = 1;
+        s->loop.levels = 1;
+        s->loop.synced = 1;
+        s->loop.ctx_size = (uint32_t)ctx_size;
+        if (e->loop_default.num_loops > 1 &&
+            ds4_session_set_loops(s, &e->loop_default, NULL, 0) != 0) {
+            ds4_session_free(s);
+            return 1;
+        }
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         if (!ds4_session_tp_register(s)) {
@@ -76010,6 +76396,7 @@ void ds4_session_free(ds4_session *s) {
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
+        loop_state_free(&s->loop);
     }
 #ifndef DS4_NO_GPU
     else {
@@ -76071,6 +76458,739 @@ int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen
 int ds4_session_power(ds4_session *s) {
     if (!s || !s->engine) return 100;
     return s->engine->power_percent;
+}
+
+/* =========================================================================
+ * Elastic Loops, Weight-Space Programming and Multi-level Decoding API.
+ * =========================================================================
+ *
+ * Three engine extensions that share one constraint: they change how the
+ * same weights are applied (looping), the weights themselves (WSP), or what a
+ * decode step emits (concepts).  All three run on the CPU reference backend,
+ * where weights are plain pointers into a private mapping and every layer
+ * pass is an explicit C call.  The graph backends keep their stock behavior
+ * and reject these requests explicitly instead of half-supporting them.
+ */
+
+static int ds4_api_err(char *err, size_t errlen, const char *fmt, ...) {
+    if (err && errlen) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(err, errlen, fmt, ap);
+        va_end(ap);
+    }
+    return 1;
+}
+
+/* ---- Elastic loops ------------------------------------------------------ */
+
+int ds4_loop_config_check(const ds4_loop_config *cfg, int n_layer,
+                          char *err, size_t errlen) {
+    if (!cfg) return ds4_api_err(err, errlen, "missing loop config");
+    if (cfg->num_loops > DS4_LOOP_MAX)
+        return ds4_api_err(err, errlen, "num_loops must be at most %d", DS4_LOOP_MAX);
+    if (cfg->kv_mode != DS4_LOOP_KV_LAST && cfg->kv_mode != DS4_LOOP_KV_PER_LOOP)
+        return ds4_api_err(err, errlen, "unknown loop KV mode");
+    if (cfg->num_loops <= 1) return 0;
+    if (cfg->rec_start >= cfg->rec_end || n_layer < 0 || cfg->rec_end > (uint32_t)n_layer)
+        return ds4_api_err(err, errlen,
+                           "recurrent block %u:%u must be a non-empty range within 0:%d",
+                           cfg->rec_start, cfg->rec_end, n_layer);
+    return 0;
+}
+
+/* Policy, in one rule: the main cache always holds one row per position and
+ * layer, so any schedule can continue from it.  Changing num_loops or the
+ * recurrent range live therefore keeps the checkpoint, and the history simply
+ * mixes the depths it was computed at: that is the elastic property.  Only
+ * per-loop levels can lack history, so a per-loop schedule needing more
+ * synced levels than exist invalidates the checkpoint.  Callers that want an
+ * exact history for the new schedule call ds4_session_invalidate(). */
+int ds4_session_set_loops(ds4_session *s, const ds4_loop_config *cfg,
+                          char *err, size_t errlen) {
+    if (!s || !s->engine) return ds4_api_err(err, errlen, "missing session");
+    if (ds4_loop_config_check(cfg, DS4_N_LAYER, err, errlen) != 0) return 1;
+    ds4_loop_config next = *cfg;
+    if (next.num_loops == 0) next.num_loops = 1;
+    if (!ds4_session_is_cpu(s)) {
+        if (next.num_loops == 1) return 0;
+        return ds4_api_err(err, errlen, "looped schedules require the CPU backend");
+    }
+    if (next.num_loops > 1 && (s->distributed || s->engine->tp.active))
+        return ds4_api_err(err, errlen,
+                           "looped schedules are not supported for distributed sessions");
+
+    ds4_loop_state *ls = &s->loop;
+    if (ls->cfg.rec_start != next.rec_start || ls->cfg.rec_end != next.rec_end ||
+        ls->cfg.kv_mode != next.kv_mode) {
+        /* Per-loop caches belong to the old range: drop them. */
+        loop_state_free_extra(ls);
+        ls->synced = 1;
+    }
+    const bool history = s->checkpoint_valid && s->checkpoint.len > 0;
+    ls->cfg = next;
+    loop_state_reserve(ls, history ? (uint32_t)s->checkpoint.len : 0);
+    if (history && loop_state_active(ls) &&
+        next.kv_mode == DS4_LOOP_KV_PER_LOOP && next.num_loops > ls->synced) {
+        ds4_session_invalidate(s);
+    }
+    return 0;
+}
+
+ds4_loop_config ds4_session_loops(ds4_session *s) {
+    ds4_loop_config cfg = {0};
+    if (s) cfg = s->loop.cfg;
+    if (cfg.num_loops == 0) cfg.num_loops = 1;
+    return cfg;
+}
+
+/* ---- Weight-Space Programming ------------------------------------------- */
+
+static bool wsp_type_editable(uint32_t type) {
+    return type == DS4_TENSOR_F32 || type == DS4_TENSOR_F16 ||
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q8_0;
+}
+
+static uint64_t wsp_cols(const ds4_tensor *t) {
+    return t->dim[0];
+}
+
+static uint64_t wsp_rows(const ds4_tensor *t) {
+    return t->dim[0] ? t->elements / t->dim[0] : 0;
+}
+
+/* Rows are addressable only when they start on a block boundary. */
+static uint64_t wsp_row_bytes(const ds4_tensor *t) {
+    const gguf_type_info *info = tensor_type(t->type);
+    if (!info || t->dim[0] % info->block_elems) return 0;
+    return t->dim[0] / info->block_elems * info->block_bytes;
+}
+
+static ds4_tensor *wsp_tensor(ds4_engine *e, int idx, bool write,
+                              char *err, size_t errlen) {
+    if (!e || idx < 0 || (uint64_t)idx >= e->model.n_tensors) {
+        ds4_api_err(err, errlen, "invalid tensor index %d", idx);
+        return NULL;
+    }
+    ds4_tensor *t = &e->model.tensors[idx];
+    if (!write) return t;
+    /* Metal wraps the shared mapping as no-copy buffers and the other graph
+     * backends upload weight copies: editing them needs a per-backend upload
+     * hook, so edits are refused rather than silently ignored. */
+    if (e->backend != DS4_BACKEND_CPU || !e->model.private_map)
+        ds4_api_err(err, errlen, "weight editing requires the CPU backend");
+    else if (e->ssd_streaming || e->distributed.role != DS4_DISTRIBUTED_NONE || e->tp.active)
+        ds4_api_err(err, errlen, "weight editing is not supported with streaming or distributed inference");
+    else if (t->abs_offset > e->model.size || t->bytes > e->model.size - t->abs_offset)
+        ds4_api_err(err, errlen, "tensor is not in the mapped weights");
+    else if (!wsp_row_bytes(t))
+        ds4_api_err(err, errlen, "tensor rows are not block aligned");
+    else
+        return t;
+    return NULL;
+}
+
+/* Make the pages covering [off, off+len) writable (copy-on-write, private
+ * mapping) or read-only again, and record the dirty span for revert. */
+static bool wsp_protect(ds4_engine *e, uint64_t off, uint64_t len, bool writable) {
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint64_t start = off & ~(page - 1);
+    const uint64_t end = off + len;
+    return mprotect((void *)(e->model.map + start), (size_t)(end - start),
+                    writable ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
+}
+
+static void wsp_mark_dirty(ds4_engine *e, const ds4_tensor *t, uint64_t off, uint64_t len) {
+    const uint64_t idx = (uint64_t)(t - e->model.tensors);
+    if (!e->wsp_lo) {
+        e->wsp_lo = xmalloc((size_t)e->model.n_tensors * sizeof(uint64_t));
+        e->wsp_hi = xcalloc((size_t)e->model.n_tensors, sizeof(uint64_t));
+        for (uint64_t i = 0; i < e->model.n_tensors; i++) e->wsp_lo[i] = UINT64_MAX;
+    }
+    if (off < e->wsp_lo[idx]) e->wsp_lo[idx] = off;
+    if (off + len > e->wsp_hi[idx]) e->wsp_hi[idx] = off + len;
+}
+
+static inline float bf16_bits_to_f32(uint16_t h) {
+    const uint32_t u = (uint32_t)h << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static inline uint16_t f32_to_bf16_bits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x40); /* quiet NaN */
+    u += 0x7fffu + ((u >> 16) & 1u);  /* round to nearest even */
+    return (uint16_t)(u >> 16);
+}
+
+/* Q8_0 block: f16 scale d, then 32 int8 q; x = d * q. */
+enum { WSP_Q8_0_ELEMS = 32, WSP_Q8_0_BYTES = 34 };
+
+static void wsp_q8_0_dequant(const uint8_t *b, float *x) {
+    uint16_t d16;
+    memcpy(&d16, b, 2);
+    const float d = f16_to_f32(d16);
+    for (int i = 0; i < WSP_Q8_0_ELEMS; i++) x[i] = d * (float)(int8_t)b[2 + i];
+}
+
+/* Same rounding as the reference GGUF quantizer. */
+static void wsp_q8_0_quant(uint8_t *b, const float *x) {
+    float amax = 0.0f;
+    for (int i = 0; i < WSP_Q8_0_ELEMS; i++) amax = fmaxf(amax, fabsf(x[i]));
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    const uint16_t d16 = f32_to_f16(d);
+    memcpy(b, &d16, 2);
+    for (int i = 0; i < WSP_Q8_0_ELEMS; i++) b[2 + i] = (uint8_t)(int8_t)roundf(x[i] * id);
+}
+
+static void wsp_row_decode(uint32_t type, const uint8_t *src, float *out, uint64_t cols) {
+    switch (type) {
+    case DS4_TENSOR_F32:
+        memcpy(out, src, (size_t)cols * sizeof(float));
+        break;
+    case DS4_TENSOR_F16:
+        for (uint64_t i = 0; i < cols; i++) {
+            uint16_t h;
+            memcpy(&h, src + i * 2, 2);
+            out[i] = f16_to_f32(h);
+        }
+        break;
+    case DS4_TENSOR_BF16:
+        for (uint64_t i = 0; i < cols; i++) {
+            uint16_t h;
+            memcpy(&h, src + i * 2, 2);
+            out[i] = bf16_bits_to_f32(h);
+        }
+        break;
+    case DS4_TENSOR_Q8_0:
+        for (uint64_t i = 0; i < cols; i += WSP_Q8_0_ELEMS)
+            wsp_q8_0_dequant(src + i / WSP_Q8_0_ELEMS * WSP_Q8_0_BYTES, out + i);
+        break;
+    }
+}
+
+/* Encode a row in place.  Q8_0 blocks whose values did not change keep their
+ * original bytes, so a narrow edit never requantizes the rest of the row. */
+static void wsp_row_encode(uint32_t type, uint8_t *dst, const float *in, uint64_t cols) {
+    switch (type) {
+    case DS4_TENSOR_F32:
+        memcpy(dst, in, (size_t)cols * sizeof(float));
+        break;
+    case DS4_TENSOR_F16:
+        for (uint64_t i = 0; i < cols; i++) {
+            const uint16_t h = f32_to_f16(in[i]);
+            memcpy(dst + i * 2, &h, 2);
+        }
+        break;
+    case DS4_TENSOR_BF16:
+        for (uint64_t i = 0; i < cols; i++) {
+            const uint16_t h = f32_to_bf16_bits(in[i]);
+            memcpy(dst + i * 2, &h, 2);
+        }
+        break;
+    case DS4_TENSOR_Q8_0:
+        for (uint64_t i = 0; i < cols; i += WSP_Q8_0_ELEMS) {
+            uint8_t *b = dst + i / WSP_Q8_0_ELEMS * WSP_Q8_0_BYTES;
+            float old[WSP_Q8_0_ELEMS];
+            wsp_q8_0_dequant(b, old);
+            if (memcmp(old, in + i, sizeof(old)) != 0) wsp_q8_0_quant(b, in + i);
+        }
+        break;
+    }
+}
+
+int ds4_wsp_tensor_count(ds4_engine *e) {
+    return e ? (int)e->model.n_tensors : 0;
+}
+
+int ds4_wsp_find(ds4_engine *e, const char *name) {
+    if (!e || !name) return -1;
+    ds4_tensor *t = model_find_tensor(&e->model, name);
+    return t ? (int)(t - e->model.tensors) : -1;
+}
+
+int ds4_wsp_info(ds4_engine *e, int tensor, ds4_wsp_tensor *out) {
+    ds4_tensor *t = wsp_tensor(e, tensor, false, NULL, 0);
+    if (!t || !out) return 1;
+    memset(out, 0, sizeof(*out));
+    const uint64_t n = t->name.len < sizeof(out->name) - 1 ? t->name.len : sizeof(out->name) - 1;
+    memcpy(out->name, t->name.ptr, (size_t)n);
+    out->type_name = tensor_type_name(t->type);
+    out->type = t->type;
+    out->ndim = t->ndim;
+    for (uint32_t i = 0; i < t->ndim && i < 4; i++) out->dim[i] = t->dim[i];
+    out->rows = wsp_rows(t);
+    out->cols = wsp_cols(t);
+    out->bytes = t->bytes;
+    out->editable = wsp_type_editable(t->type) && wsp_row_bytes(t) != 0;
+    out->dirty = e->wsp_lo && e->wsp_hi[tensor] > e->wsp_lo[tensor];
+    return 0;
+}
+
+int ds4_wsp_read_row(ds4_engine *e, int tensor, uint64_t row, float *out,
+                     char *err, size_t errlen) {
+    ds4_tensor *t = wsp_tensor(e, tensor, false, err, errlen);
+    if (!t || !out) return 1;
+    if (!wsp_type_editable(t->type) || !wsp_row_bytes(t))
+        return ds4_api_err(err, errlen, "%s rows cannot be decoded", tensor_type_name(t->type));
+    if (row >= wsp_rows(t)) return ds4_api_err(err, errlen, "row %llu out of range",
+                                               (unsigned long long)row);
+    wsp_row_decode(t->type, (const uint8_t *)tensor_data(&e->model, t) + row * wsp_row_bytes(t),
+                   out, wsp_cols(t));
+    return 0;
+}
+
+/* Every edit funnels through here: rows [first, first+count) are rewritten by
+ * fn (decoded rows) or zeroed (fn == NULL, valid for any block type). */
+typedef void (*wsp_row_fn)(float *row, uint64_t r, uint64_t cols, void *ud);
+
+static int wsp_edit_rows(ds4_engine *e, int tensor, uint64_t first, uint64_t count,
+                         wsp_row_fn fn, void *ud, char *err, size_t errlen) {
+    ds4_tensor *t = wsp_tensor(e, tensor, true, err, errlen);
+    if (!t) return 1;
+    if (fn && !wsp_type_editable(t->type))
+        return ds4_api_err(err, errlen, "%s supports only masking whole rows",
+                           tensor_type_name(t->type));
+    const uint64_t rows = wsp_rows(t);
+    if (first > rows || count > rows - first)
+        return ds4_api_err(err, errlen, "rows %llu+%llu out of range (%llu rows)",
+                           (unsigned long long)first, (unsigned long long)count,
+                           (unsigned long long)rows);
+    if (count == 0) return 0;
+
+    const uint64_t rb = wsp_row_bytes(t);
+    const uint64_t off = t->abs_offset + first * rb;
+    const uint64_t len = count * rb;
+    if (!wsp_protect(e, off, len, true))
+        return ds4_api_err(err, errlen, "cannot unprotect weights: %s", strerror(errno));
+    uint8_t *base = (uint8_t *)e->model.map + off;
+    if (!fn) {
+        memset(base, 0, (size_t)len);
+    } else {
+        const uint64_t cols = wsp_cols(t);
+        float *row = xmalloc((size_t)cols * sizeof(float));
+        for (uint64_t r = 0; r < count; r++) {
+            wsp_row_decode(t->type, base + r * rb, row, cols);
+            fn(row, first + r, cols, ud);
+            wsp_row_encode(t->type, base + r * rb, row, cols);
+        }
+        free(row);
+    }
+    wsp_protect(e, off, len, false);
+    wsp_mark_dirty(e, t, off, len);
+    return 0;
+}
+
+static void wsp_row_copy(float *row, uint64_t r, uint64_t cols, void *ud) {
+    (void)r;
+    memcpy(row, ud, (size_t)cols * sizeof(float));
+}
+
+int ds4_wsp_write_row(ds4_engine *e, int tensor, uint64_t row, const float *in,
+                      char *err, size_t errlen) {
+    if (!in) return ds4_api_err(err, errlen, "missing row data");
+    return wsp_edit_rows(e, tensor, row, 1, wsp_row_copy, (void *)in, err, errlen);
+}
+
+typedef struct {
+    ds4_wsp_axis axis;
+    uint64_t first, count;
+    float factor;
+} wsp_scale_ctx;
+
+static void wsp_row_scale(float *row, uint64_t r, uint64_t cols, void *ud) {
+    const wsp_scale_ctx *c = ud;
+    (void)r;
+    const uint64_t a = c->axis == DS4_WSP_COLS ? c->first : 0;
+    const uint64_t b = c->axis == DS4_WSP_COLS ? c->first + c->count : cols;
+    for (uint64_t i = a; i < b; i++) row[i] *= c->factor;
+}
+
+int ds4_wsp_scale(ds4_engine *e, int tensor, ds4_wsp_axis axis,
+                  uint64_t first, uint64_t count, float factor,
+                  char *err, size_t errlen) {
+    ds4_tensor *t = wsp_tensor(e, tensor, false, err, errlen);
+    if (!t) return 1;
+    if (!isfinite(factor)) return ds4_api_err(err, errlen, "scale factor must be finite");
+    wsp_scale_ctx c = {.axis = axis, .first = first, .count = count, .factor = factor};
+    if (axis == DS4_WSP_ROWS) {
+        /* Zeroing whole rows works on raw bytes for every block type. */
+        return wsp_edit_rows(e, tensor, first, count,
+                             factor == 0.0f ? NULL : wsp_row_scale, &c, err, errlen);
+    }
+    if (axis != DS4_WSP_COLS) return ds4_api_err(err, errlen, "unknown axis");
+    const uint64_t cols = wsp_cols(t);
+    if (first > cols || count > cols - first)
+        return ds4_api_err(err, errlen, "cols %llu+%llu out of range (%llu cols)",
+                           (unsigned long long)first, (unsigned long long)count,
+                           (unsigned long long)cols);
+    return wsp_edit_rows(e, tensor, 0, wsp_rows(t), wsp_row_scale, &c, err, errlen);
+}
+
+typedef struct {
+    const float *m;
+    FILE *fp;
+    bool short_read;
+} wsp_load_ctx;
+
+static void wsp_row_load(float *row, uint64_t r, uint64_t cols, void *ud) {
+    wsp_load_ctx *c = ud;
+    if (c->m) {
+        memcpy(row, c->m + r * cols, (size_t)cols * sizeof(float));
+    } else if (fread(row, sizeof(float), (size_t)cols, c->fp) != cols) {
+        c->short_read = true;
+        memset(row, 0, (size_t)cols * sizeof(float));
+    }
+}
+
+int ds4_wsp_load_matrix(ds4_engine *e, int tensor, const float *m,
+                        uint64_t rows, uint64_t cols, char *err, size_t errlen) {
+    ds4_tensor *t = wsp_tensor(e, tensor, false, err, errlen);
+    if (!t || !m) return t ? ds4_api_err(err, errlen, "missing matrix") : 1;
+    if (rows != wsp_rows(t) || cols != wsp_cols(t))
+        return ds4_api_err(err, errlen, "matrix is %llux%llu, tensor is %llux%llu",
+                           (unsigned long long)rows, (unsigned long long)cols,
+                           (unsigned long long)wsp_rows(t), (unsigned long long)wsp_cols(t));
+    wsp_load_ctx c = {.m = m};
+    return wsp_edit_rows(e, tensor, 0, rows, wsp_row_load, &c, err, errlen);
+}
+
+int ds4_wsp_load_file(ds4_engine *e, int tensor, const char *path,
+                      char *err, size_t errlen) {
+    ds4_tensor *t = wsp_tensor(e, tensor, false, err, errlen);
+    if (!t) return 1;
+    FILE *fp = path ? fopen(path, "rb") : NULL;
+    if (!fp) return ds4_api_err(err, errlen, "cannot open %s", path ? path : "(null)");
+    struct stat st;
+    const uint64_t want = wsp_rows(t) * wsp_cols(t) * sizeof(float);
+    if (fstat(fileno(fp), &st) != 0 || (uint64_t)st.st_size != want) {
+        fclose(fp);
+        return ds4_api_err(err, errlen, "%s must hold %llu f32 values (%llux%llu)", path,
+                           (unsigned long long)(want / sizeof(float)),
+                           (unsigned long long)wsp_rows(t), (unsigned long long)wsp_cols(t));
+    }
+    wsp_load_ctx c = {.fp = fp};
+    int rc = wsp_edit_rows(e, tensor, 0, wsp_rows(t), wsp_row_load, &c, err, errlen);
+    fclose(fp);
+    if (rc == 0 && c.short_read) rc = ds4_api_err(err, errlen, "short read from %s", path);
+    return rc;
+}
+
+/* The private mapping maps file offset == map offset, so reverting is a
+ * plain re-read of the dirty span from the GGUF. */
+int ds4_wsp_revert(ds4_engine *e, int tensor, char *err, size_t errlen) {
+    ds4_tensor *t = wsp_tensor(e, tensor, false, err, errlen);
+    if (!t) return 1;
+    if (!e->wsp_lo || e->wsp_hi[tensor] <= e->wsp_lo[tensor]) return 0;
+    const uint64_t off = e->wsp_lo[tensor];
+    const uint64_t len = e->wsp_hi[tensor] - off;
+    if (!wsp_protect(e, off, len, true))
+        return ds4_api_err(err, errlen, "cannot unprotect weights: %s", strerror(errno));
+    uint8_t *dst = (uint8_t *)e->model.map + off;
+    uint64_t done = 0;
+    while (done < len) {
+        const ssize_t n = pread(e->model.fd, dst + done, (size_t)(len - done), (off_t)(off + done));
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            wsp_protect(e, off, len, false);
+            return ds4_api_err(err, errlen, "cannot re-read weights from the model file");
+        }
+        done += (uint64_t)n;
+    }
+    wsp_protect(e, off, len, false);
+    e->wsp_lo[tensor] = UINT64_MAX;
+    e->wsp_hi[tensor] = 0;
+    return 0;
+}
+
+int ds4_wsp_revert_all(ds4_engine *e, char *err, size_t errlen) {
+    if (!e) return 1;
+    for (uint64_t i = 0; e->wsp_lo && i < e->model.n_tensors; i++) {
+        if (ds4_wsp_revert(e, (int)i, err, errlen) != 0) return 1;
+    }
+    return 0;
+}
+
+uint64_t ds4_wsp_dirty_bytes(ds4_engine *e) {
+    uint64_t total = 0;
+    for (uint64_t i = 0; e && e->wsp_lo && i < e->model.n_tensors; i++) {
+        if (e->wsp_hi[i] > e->wsp_lo[i]) total += e->wsp_hi[i] - e->wsp_lo[i];
+    }
+    return total;
+}
+
+/* Parse "N" or "A-B" (inclusive) items of a comma list, one at a time. */
+static bool wsp_next_range(const char **p, uint64_t *first, uint64_t *count) {
+    if (!**p) return false;
+    char *end;
+    errno = 0;
+    const unsigned long long a = strtoull(*p, &end, 10);
+    if (end == *p || errno) return false;
+    unsigned long long b = a;
+    if (*end == '-') {
+        const char *q = end + 1;
+        b = strtoull(q, &end, 10);
+        if (end == q || errno || b < a) return false;
+    }
+    if (*end == ',') end++;
+    else if (*end) return false;
+    *p = end;
+    *first = a;
+    *count = b - a + 1;
+    return true;
+}
+
+static int wsp_script_line(ds4_engine *e, char *line, const char *dir,
+                           char *err, size_t errlen) {
+    char *tok[6];
+    int n = 0;
+    for (char *save = NULL, *t = strtok_r(line, " \t\r\n", &save);
+         t && n < 6; t = strtok_r(NULL, " \t\r\n", &save)) {
+        tok[n++] = t;
+    }
+    if (n == 0 || tok[0][0] == '#') return 0;
+
+    const char *op = tok[0];
+    if (!strcmp(op, "revert") && n == 2 && !strcmp(tok[1], "*"))
+        return ds4_wsp_revert_all(e, err, errlen);
+    if (n < 2) return ds4_api_err(err, errlen, "missing tensor name");
+    const int idx = ds4_wsp_find(e, tok[1]);
+    if (idx < 0) return ds4_api_err(err, errlen, "unknown tensor %s", tok[1]);
+
+    if (!strcmp(op, "revert") && n == 2) return ds4_wsp_revert(e, idx, err, errlen);
+    if (!strcmp(op, "load") && n == 3) {
+        char path[4096];
+        const size_t dl = tok[2][0] != '/' && dir ? strlen(dir) : 0;
+        const size_t fl = strlen(tok[2]);
+        if (dl + 1 + fl >= sizeof(path)) return ds4_api_err(err, errlen, "path too long");
+        if (dl) {
+            memcpy(path, dir, dl);
+            path[dl] = '/';
+        }
+        memcpy(path + (dl ? dl + 1 : 0), tok[2], fl + 1);
+        return ds4_wsp_load_file(e, idx, path, err, errlen);
+    }
+
+    const bool mask = !strcmp(op, "mask") && n == 4;
+    const bool scale = !strcmp(op, "scale") && n == 5;
+    if (!mask && !scale) return ds4_api_err(err, errlen, "malformed '%s' line", op);
+    ds4_wsp_axis axis;
+    if (!strcmp(tok[2], "rows")) axis = DS4_WSP_ROWS;
+    else if (!strcmp(tok[2], "cols")) axis = DS4_WSP_COLS;
+    else return ds4_api_err(err, errlen, "axis must be rows or cols, not %s", tok[2]);
+    float factor = 0.0f;
+    if (scale) {
+        char *end;
+        factor = strtof(tok[4], &end);
+        if (*end) return ds4_api_err(err, errlen, "bad factor %s", tok[4]);
+    }
+    const char *p = tok[3];
+    uint64_t first, count;
+    while (*p) {
+        if (!wsp_next_range(&p, &first, &count))
+            return ds4_api_err(err, errlen, "bad range list %s", tok[3]);
+        if (ds4_wsp_scale(e, idx, axis, first, count, factor, err, errlen) != 0) return 1;
+    }
+    return 0;
+}
+
+int ds4_wsp_apply_script(ds4_engine *e, const char *path, char *err, size_t errlen) {
+    FILE *fp = path ? fopen(path, "r") : NULL;
+    if (!fp) return ds4_api_err(err, errlen, "cannot open %s", path ? path : "(null)");
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = '\0';
+
+    char line[8192];
+    int lineno = 0, rc = 0;
+    while (rc == 0 && fgets(line, sizeof(line), fp)) {
+        lineno++;
+        char msg[512] = {0};
+        rc = wsp_script_line(e, line, slash ? dir : NULL, msg, sizeof(msg));
+        if (rc) ds4_api_err(err, errlen, "%s:%d: %s", path, lineno, msg);
+    }
+    fclose(fp);
+    return rc;
+}
+
+/* ---- Coarse-to-fine multi-level decoding --------------------------------- */
+
+struct ds4_mlc {
+    uint32_t levels;
+    uint32_t dim;
+    uint32_t k[DS4_MLC_MAX_LEVELS];
+    float *book[DS4_MLC_MAX_LEVELS];    /* k[l] x dim, row-major */
+};
+
+void ds4_mlc_free(ds4_mlc *m) {
+    if (!m) return;
+    for (uint32_t l = 0; l < m->levels; l++) free(m->book[l]);
+    free(m);
+}
+
+int ds4_mlc_open(ds4_mlc **out, const char *path, char *err, size_t errlen) {
+    if (!out) return 1;
+    *out = NULL;
+    FILE *fp = path ? fopen(path, "rb") : NULL;
+    if (!fp) return ds4_api_err(err, errlen, "cannot open %s", path ? path : "(null)");
+    ds4_mlc *m = xcalloc(1, sizeof(*m));
+    char magic[4];
+    uint32_t version = 0;
+    int rc = 0;
+    if (fread(magic, 1, 4, fp) != 4 || memcmp(magic, "DS4C", 4) ||
+        fread(&version, 4, 1, fp) != 1 || version != 1 ||
+        fread(&m->levels, 4, 1, fp) != 1 || fread(&m->dim, 4, 1, fp) != 1) {
+        rc = ds4_api_err(err, errlen, "%s is not a DS4C v1 codebook file", path);
+    } else if (m->levels == 0 || m->levels > DS4_MLC_MAX_LEVELS ||
+               m->dim == 0 || m->dim > (1u << 20)) {
+        rc = ds4_api_err(err, errlen, "%s: unsupported shape %u levels x %u dims",
+                         path, m->levels, m->dim);
+        m->levels = 0;
+    }
+    for (uint32_t l = 0; rc == 0 && l < m->levels; l++) {
+        uint32_t k = 0;
+        if (fread(&k, 4, 1, fp) != 1 || k == 0 || k > (1u << 20)) {
+            rc = ds4_api_err(err, errlen, "%s: bad codebook size at level %u", path, l);
+            m->levels = l;
+            break;
+        }
+        m->k[l] = k;
+        m->book[l] = xmalloc((size_t)k * m->dim * sizeof(float));
+        if (fread(m->book[l], sizeof(float), (size_t)k * m->dim, fp) != (size_t)k * m->dim) {
+            rc = ds4_api_err(err, errlen, "%s: truncated level %u", path, l);
+            m->levels = l + 1;
+        }
+    }
+    fclose(fp);
+    if (rc) {
+        ds4_mlc_free(m);
+        return rc;
+    }
+    *out = m;
+    return 0;
+}
+
+int ds4_mlc_levels(const ds4_mlc *m) {
+    return m ? (int)m->levels : 0;
+}
+
+int ds4_mlc_dim(const ds4_mlc *m) {
+    return m ? (int)m->dim : 0;
+}
+
+int ds4_mlc_concept(const ds4_mlc *m, const int *codes, int levels, float *concept) {
+    if (!m || !codes || !concept || levels < 0 || (uint32_t)levels > m->levels) return 1;
+    memset(concept, 0, (size_t)m->dim * sizeof(float));
+    for (int l = 0; l < levels; l++) {
+        if (codes[l] < 0 || (uint32_t)codes[l] >= m->k[l]) return 1;
+        const float *row = m->book[l] + (uint64_t)codes[l] * m->dim;
+        for (uint32_t i = 0; i < m->dim; i++) concept[i] += row[i];
+    }
+    return 0;
+}
+
+/* Residual quantization, coarse to fine: each level explains what the
+ * previous levels left of the hidden vector. */
+int ds4_mlc_decode(const ds4_mlc *m, const float *hidden, int max_levels,
+                   float temperature, uint64_t *rng, int *codes, float *concept) {
+    if (!m || !hidden || !codes) return 1;
+    if (max_levels <= 0 || (uint32_t)max_levels > m->levels) max_levels = (int)m->levels;
+    if (temperature > 0.0f && !rng) return 1;
+    uint32_t kmax = 0;
+    for (int l = 0; l < max_levels; l++) if (m->k[l] > kmax) kmax = m->k[l];
+    float *r = xmalloc((size_t)m->dim * sizeof(float));
+    float *score = xmalloc((size_t)kmax * sizeof(float));
+    memcpy(r, hidden, (size_t)m->dim * sizeof(float));
+
+    for (int l = 0; l < max_levels; l++) {
+        const float *book = m->book[l];
+        for (uint32_t k = 0; k < m->k[l]; k++) {
+            const float *row = book + (uint64_t)k * m->dim;
+            float dot = 0.0f;
+            for (uint32_t i = 0; i < m->dim; i++) dot += row[i] * r[i];
+            score[k] = dot;
+        }
+        codes[l] = ds4_sample_logits(score, (int)m->k[l], temperature, 0, 1.0f, 0.0f, rng);
+        const float *pick = book + (uint64_t)codes[l] * m->dim;
+        for (uint32_t i = 0; i < m->dim; i++) r[i] -= pick[i];
+    }
+    free(score);
+    free(r);
+    return concept ? ds4_mlc_concept(m, codes, max_levels, concept) : 0;
+}
+
+int ds4_session_hidden(ds4_session *s, float *out, int cap) {
+    if (!s || !out || !ds4_session_is_cpu(s) || !s->checkpoint_valid ||
+        !s->hidden_valid || cap < (int)DS4_N_EMBD) {
+        return -1;
+    }
+    memcpy(out, s->cpu_scratch.output_norm, (size_t)DS4_N_EMBD * sizeof(float));
+    return (int)DS4_N_EMBD;
+}
+
+int ds4_session_eval_embedding(ds4_session *s, const float *embd, int token_tag,
+                               char *err, size_t errlen) {
+    if (!s || !embd) return ds4_api_err(err, errlen, "missing session or embedding");
+    if (!ds4_session_is_cpu(s))
+        return ds4_api_err(err, errlen, "embedding steps require the CPU backend");
+    if (s->distributed || s->engine->tp.active)
+        return ds4_api_err(err, errlen, "embedding steps are not supported for distributed sessions");
+    if (!s->checkpoint_valid)
+        return ds4_api_err(err, errlen, "session has no valid checkpoint");
+    if (token_tag < 0 || token_tag >= (int)DS4_N_VOCAB)
+        return ds4_api_err(err, errlen, "token_tag %d out of vocabulary", token_tag);
+    if (s->checkpoint.len >= s->ctx_size)
+        return ds4_api_err(err, errlen, "context is full");
+    session_cpu_forward(s, token_tag, embd);
+    token_vec_push(&s->checkpoint, token_tag);
+    s->mtp_draft_valid = false;
+    return 0;
+}
+
+int ds4_session_step(ds4_session *s, const ds4_step_options *opt, ds4_step *out,
+                     char *err, size_t errlen) {
+    if (!s || !opt || !out) return ds4_api_err(err, errlen, "missing step arguments");
+    memset(out, 0, sizeof(*out));
+    if (!opt->mlc) {
+        const int token = ds4_session_sample(s, opt->temperature, opt->top_k,
+                                             opt->top_p, opt->min_p, opt->rng);
+        if (token < 0) return ds4_api_err(err, errlen, "session has no logits to sample");
+        out->kind = DS4_STEP_TOKEN;
+        out->token = token;
+        return ds4_session_eval(s, token, err, errlen);
+    }
+
+    const ds4_mlc *m = opt->mlc;
+    if (ds4_mlc_dim(m) != (int)DS4_N_EMBD)
+        return ds4_api_err(err, errlen, "codebook dim %d does not match model dim %d",
+                           ds4_mlc_dim(m), (int)DS4_N_EMBD);
+    float *hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *concept = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    int rc = 0;
+    if (ds4_session_hidden(s, hidden, (int)DS4_N_EMBD) < 0) {
+        rc = ds4_api_err(err, errlen, "no hidden state: concept steps need the CPU "
+                                      "backend after a sync or eval");
+    } else {
+        const int levels = opt->mlc_levels > 0 && opt->mlc_levels < ds4_mlc_levels(m) ?
+                           opt->mlc_levels : ds4_mlc_levels(m);
+        if (ds4_mlc_decode(m, hidden, levels, opt->temperature, opt->rng,
+                           out->codes, concept) != 0) {
+            rc = ds4_api_err(err, errlen, "concept decode failed");
+        } else {
+            out->kind = DS4_STEP_CONCEPT;
+            out->token = opt->concept_tag;
+            out->levels = levels;
+            rc = ds4_session_eval_embedding(s, concept, opt->concept_tag, err, errlen);
+        }
+    }
+    free(concept);
+    free(hidden);
+    return rc;
 }
 
 bool ds4_session_is_distributed(ds4_session *s) {
@@ -78124,6 +79244,17 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 #endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        const bool reusable = s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint);
+        if (!reusable && loop_state_active(&s->loop)) {
+            /* Layer-major prefill implements only the stock schedule, so a
+             * looped session rebuilds one position at a time, through the
+             * same code that decodes. */
+            session_cpu_reset_cache(s);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = true;
+        }
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -78136,16 +79267,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     s->mtp_draft_valid = false;
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
-                forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                         &e->model,
-                                                         &e->weights,
-                                                         &s->cpu_cache,
-                                                         prompt->v[i],
-                                                         (uint32_t)s->checkpoint.len,
-                                                         e->directional_steering_dirs,
-                                                         e->directional_steering_attn_scale,
-                                                         e->directional_steering_ffn_scale,
-                                                         &s->cpu_scratch);
+                session_cpu_forward(s, prompt->v[i], NULL);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
             }
@@ -78157,6 +79279,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 
         session_cpu_reset_cache(s);
         prefill_layer_major_cpu(s->logits,
+                                s->cpu_scratch.output_norm,
                                 &e->model,
                                 &e->weights,
                                 &s->cpu_cache,
@@ -78167,6 +79290,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        s->hidden_valid = prompt->len > 0;
         ds4_session_dspark_capture_note_checkpoint(s);
         if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
         return 0;
@@ -80243,17 +81367,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      errlen);
     }
     if (ds4_session_is_cpu(s)) {
-        ds4_engine *e = s->engine;
-        forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                 &e->model,
-                                                 &e->weights,
-                                                 &s->cpu_cache,
-                                                 token,
-                                                 (uint32_t)s->checkpoint.len,
-                                                 e->directional_steering_dirs,
-                                                 e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
-                                                 &s->cpu_scratch);
+        session_cpu_forward(s, token, NULL);
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;

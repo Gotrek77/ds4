@@ -217,6 +217,18 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
     return v;
 }
 
+/* "A:B": recurrent block of layers A..B-1. */
+static void parse_loop_block(const char *s, ds4_loop_config *cfg) {
+    unsigned a = 0, b = 0;
+    char tail = 0;
+    if (sscanf(s, "%u:%u%c", &a, &b, &tail) != 2 || a >= b) {
+        fprintf(stderr, "ds4: invalid value for --loop-block: %s (want A:B with A < B)\n", s);
+        exit(2);
+    }
+    cfg->rec_start = a;
+    cfg->rec_end = b;
+}
+
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
 #ifdef DS4_ROCM_BUILD
@@ -1292,6 +1304,7 @@ static void print_repl_help(void) {
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
+    puts("  /loops [N]     Set recurrent block passes (CPU, --loop-block); no value shows it.");
     puts("  /read FILE     Submit a text file, PNG, or JPEG.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
@@ -1802,6 +1815,34 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                     printf("Steering FFN: %g.\n", (double)scale);
                 }
             }
+        } else if (!strncmp(cmd, "/loops", 6) &&
+                   (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
+            char *arg = trim_inplace(cmd + 6);
+            ds4_loop_config loop = ds4_session_loops(chat.session);
+            if (arg[0]) {
+                char *end = NULL;
+                long n = strtol(arg, &end, 10);
+                char err[256] = {0};
+                if (*end || n < 1 || n > DS4_LOOP_MAX) {
+                    fprintf(stderr, "ds4: /loops must be between 1 and %d\n", DS4_LOOP_MAX);
+                } else {
+                    /* Keep the block from the command line when the session runs stock. */
+                    if (loop.rec_start >= loop.rec_end) {
+                        loop.rec_start = cfg->engine.loop.rec_start;
+                        loop.rec_end = cfg->engine.loop.rec_end;
+                        loop.kv_mode = cfg->engine.loop.kv_mode;
+                    }
+                    loop.num_loops = (uint32_t)n;
+                    if (ds4_session_set_loops(chat.session, &loop, err, sizeof(err)) != 0)
+                        fprintf(stderr, "ds4: %s\n", err);
+                    else
+                        cfg->engine.loop = loop;
+                    loop = ds4_session_loops(chat.session);
+                }
+            }
+            printf("Loops: %u over layers %u:%u, %s KV.\n", loop.num_loops,
+                   loop.rec_start, loop.rec_end,
+                   loop.kv_mode == DS4_LOOP_KV_PER_LOOP ? "per-loop" : "last-loop");
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {
@@ -2109,6 +2150,20 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
             c.engine.directional_steering_ffn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--loops")) {
+            c.engine.loop.num_loops = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--loop-block")) {
+            parse_loop_block(need_arg(&i, argc, argv, arg), &c.engine.loop);
+        } else if (!strcmp(arg, "--loop-kv")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (!strcmp(mode, "last")) c.engine.loop.kv_mode = DS4_LOOP_KV_LAST;
+            else if (!strcmp(mode, "per-loop")) c.engine.loop.kv_mode = DS4_LOOP_KV_PER_LOOP;
+            else {
+                fprintf(stderr, "ds4: --loop-kv must be last or per-loop\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--wsp")) {
+            c.engine.wsp_script = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
