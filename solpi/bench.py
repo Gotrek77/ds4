@@ -104,8 +104,10 @@ def run_episode(task, mode, args, outdir):
             sampler.stop()
         res = summarize(agent, mem, sampler)
         res.update(task=task, workspace=ws)
+        res["error"] = agent.error
         print(f"[{tag}] {'solved' if res['solved'] else 'NOT solved'} in {res['turns']} turns, "
-              f"{res['prefill_tokens']} prefilled tokens, {res['wall_s']:.1f}s", flush=True)
+              f"{res['prefill_tokens']} prefilled tokens, {res['wall_s']:.1f}s"
+              + (f"; error: {agent.error}" if agent.error else ""), flush=True)
         return res
     finally:
         if sampler:

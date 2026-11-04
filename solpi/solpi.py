@@ -319,6 +319,7 @@ class Agent:
         self.obs_bytes_raw = 0
         self.obs_bytes_sent = 0
         self.passed_seen = False
+        self.error = None
 
     def _execute(self, name, args):
         if name == "read_file":
@@ -381,7 +382,16 @@ class Agent:
                        "temperature": 0, "max_tokens": self.max_tokens, "think": False,
                        "stream": False}
             t_req = time.time()
-            resp = chat(self.url, payload)
+            try:
+                resp = chat(self.url, payload)
+            except urllib.error.HTTPError as e:
+                # e.g. a prompt longer than the server context: a result, not a crash
+                body = e.read().decode("utf-8", "replace")[:300]
+                self.error = f"HTTP {e.code}: {body}"
+                break
+            except urllib.error.URLError as e:
+                self.error = f"server unreachable: {e.reason}"
+                break
             latency = time.time() - t_req
             usage = resp.get("usage", {})
             details = usage.get("prompt_tokens_details") or {}

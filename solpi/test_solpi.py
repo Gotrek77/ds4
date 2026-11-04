@@ -121,6 +121,25 @@ def main():
     a.observe("run", {"command": "python3 run_tests.py | tail -3"})
     assert a.passed_seen
 
+    # A server that rejects the request ends the episode with an error, not a crash.
+    class Reject(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = b'{"error":{"message":"prompt exceeds context"}}'
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    rej = HTTPServer(("127.0.0.1", 0), Reject)
+    threading.Thread(target=rej.serve_forever, daemon=True).start()
+    a = solpi.Agent(f"http://127.0.0.1:{rej.server_address[1]}",
+                    solpi.new_workspace(tmp, "schedule"), "schedule.py").run()
+    assert a.error.startswith("HTTP 400") and not a.solved_ok and a.turns == []
+    rej.shutdown()
+
     for start in ("cold", "log"):
         results = {}
         for task, (module, _, _) in solpi.TASKS.items():
