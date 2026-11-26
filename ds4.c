@@ -88508,6 +88508,7 @@ static int ds41_session_propose(ds4_session *s, int first_token, int cap, int eo
         if (!lookup_only) ds4_session_dspark_scheduler_note(s, 0, true, 0.0);
         return 0;
     }
+    if (ds4_session_cancelled(s)) return DS41_PROPOSE_CANCELLED;
     if (stats) {
         s->dspark_stats.propose_ms += (now_sec() - p->started) * 1000;
         s->dspark_stats.proposed_tokens += count - 1u;
@@ -88564,7 +88565,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         return -1;
     }
     if (proposed_rc < 0) {
-        snprintf(err, errlen, "V4.1 DSpark draft failed at position %u", g->pos);
+        snprintf(err, errlen, "V4.1 DSpark draft/verification failed at position %u", g->pos);
         if (e->tp.active) ds4_tp_mark_failed(e->tp.ctx);
         return -1;
     }
@@ -88572,10 +88573,6 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         if (ds4_session_eval(s, first_token, err, errlen)) return -1;
         accepted[0] = first_token;
         return 1;
-    }
-    if (ds4_session_cancelled(s)) {
-        snprintf(err, errlen, "interrupted");
-        return -1;
     }
     const int *tokens = p.tokens;
     const uint32_t count = p.count;
@@ -88625,16 +88622,24 @@ fail:
     return -1;
 }
 
-/* Ordered fallback: one complete speculative cycle per session. */
+/* Ordered fallback: one complete speculative cycle per session.  A member
+ * cancelled by its client still decodes its fed token, as in the plain
+ * ordered batch: the other members' requests must not fail with it. */
 static int ds4_sessions_speculate_ordered(ds4_decode_item *items, int count, const int *limits,
         int eos, int (*accepted)[DS4_SPEC_BLOCK_MAX], int *n_accepted, char *err, size_t errlen) {
     for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
         const int limit = limits[i] < 1 ? 1 : limits[i] > DS4_SPEC_BLOCK_MAX ? DS4_SPEC_BLOCK_MAX : limits[i];
-        const int n = ds4_session_eval_speculative_argmax(items[i].session, items[i].token, limit, eos,
-                                                          accepted[i], DS4_SPEC_BLOCK_MAX, err, errlen);
+        int n = ds4_session_cancelled(s) ? 0 :
+            ds4_session_eval_speculative_argmax(s, items[i].token, limit, eos,
+                                                accepted[i], DS4_SPEC_BLOCK_MAX, err, errlen);
+        if ((n == 0 || (n < 0 && s->checkpoint_valid && ds4_session_cancelled(s))) &&
+            ds4_session_eval(s, items[i].token, err, errlen) == 0) {
+            accepted[i][0] = items[i].token;
+            n = 1;
+        }
         if (n <= 0) {
             for (int j = 0; j < count; j++) ds4_session_invalidate(items[j].session);
-            if (n == 0 && err && errlen) snprintf(err, errlen, "speculative decode committed nothing");
             return 1;
         }
         n_accepted[i] = n;
@@ -88665,7 +88670,8 @@ static bool ds41_spec_batch_supported(ds4_decode_item *items, int count, const d
  *
  * Acceptance is greedy, as in the single-session opportunistic mode: the fed
  * token was sampled by the caller, drafts are committed while they match the
- * target's argmax.  Verify segments go first so the batch workspace is a
+ * target's argmax.  Verify segments go first: the batch workspace is the
+ * first graph among equals, so with the server's equal-context slots it is a
  * verify row graph, as in single-session verification. */
 static int ds41_sessions_speculate_batch(ds4_decode_item *items, int count, const int *limits,
         int eos, int (*accepted)[DS4_SPEC_BLOCK_MAX], int *n_accepted, char *err, size_t errlen) {
