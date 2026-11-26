@@ -62988,7 +62988,7 @@ typedef struct ds4_dspark_spec_stats {
     uint64_t verifier_errors;
     uint64_t lookup_cycles;
     uint64_t lookup_proposed_tokens;
-    uint64_t lookup_accepted_tokens;
+    uint64_t lookup_accepted_tokens; /* V4.1 only; V4 Flash credits the cycle */
     double target_ms;
     double saved_ms;
     double propose_ms;
@@ -76303,7 +76303,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             net_saved,
             draft_hist,
             accept_hist);
-    if (st->lookup_cycles) {
+    if (st->lookup_cycles && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         fprintf(stderr,
                 "ds4: prompt lookup cycles=%llu proposed=%llu accepted=%llu accept_rate=%.2f%%\n",
                 (unsigned long long)st->lookup_cycles,
@@ -76312,6 +76312,12 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
                 st->lookup_proposed_tokens ?
                     100.0 * (double)st->lookup_accepted_tokens /
                     (double)st->lookup_proposed_tokens : 0.0);
+    } else if (st->lookup_cycles) {
+        /* Lookup and drafter tokens share one verify block here; their
+         * acceptance is in accepted_draft above. */
+        fprintf(stderr, "ds4: prompt lookup cycles=%llu proposed=%llu\n",
+                (unsigned long long)st->lookup_cycles,
+                (unsigned long long)st->lookup_proposed_tokens);
     }
 }
 #endif
@@ -81081,6 +81087,46 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
 }
 
 /* Support weights and DSpark scratch live on the configured executor tier. */
+/* Prompt lookup on top of a greedy DeepSeek V4 Flash DSpark proposal (see
+ * ds4_lookup.h).  Unlike V4.1 the drafter still runs every cycle: its draft
+ * cache follows every target position, so a skipped pass is not free.  A
+ * strong match replaces the proposal; a weaker one only extends a proposal it
+ * agrees with.  Accepted lookup tokens credit the cycle in the scheduler,
+ * which here prices drafter and lookup together.  The block stays one row
+ * short of the maximum so a fused seed still fits.  Stochastic proposals
+ * carry draft probabilities and TP lockstep proposals are checked by the
+ * worker; both are left alone. */
+static void ds4_session_dspark_lookup_fuse(ds4_session *s, int token) {
+    ds4_engine *e = s->engine;
+    const bool stochastic = s->dspark_sample_rng != NULL && s->dspark_sample_temperature > 0.0f;
+    if (!ds4_lookup_enabled() || stochastic || s->dspark_stochastic_draft || s->dspark_tp_proposal ||
+        e->tp.active || e->quality || e->dspark_strict) return;
+    uint32_t cap = e->dspark_weights.block_size;
+    const uint32_t verify_cap = ds4_dspark_env_u32("DS4_DSPARK_VERIFY_CAP",
+        ds4_session_dspark_rocm_gfx1151_fast_path(s) ? 5u : 0u);
+    if (verify_cap != 0 && verify_cap < cap) cap = verify_cap;
+    if (cap > DS4_DSPARK_MAX_BLOCK_SIZE - 1u) cap = DS4_DSPARK_MAX_BLOCK_SIZE - 1u;
+    if (cap == 0) return;
+    int look[DS4_DSPARK_MAX_BLOCK_SIZE];
+    const ds4_lookup_result lk = ds4_lookup_propose(s->checkpoint.v, s->checkpoint.len,
+                                                    token, look, (int)cap);
+    if (lk.n == 0) return;
+    const uint32_t len = s->dspark_draft_valid ? s->dspark_draft_len : 0u;
+    const uint32_t shared = len < (uint32_t)lk.n ? len : (uint32_t)lk.n;
+    const bool agrees = !memcmp(s->dspark_draft_tokens, look, shared * sizeof(look[0]));
+    const bool strong = lk.match >= DS4_LOOKUP_STRONG_MATCH;
+    if (agrees ? len >= (uint32_t)lk.n || (!strong && len < DS4_LOOKUP_AGREE) : !strong)
+        return;
+    const uint32_t from = agrees ? len : 0u;
+    memcpy(s->dspark_draft_tokens + from, look + from, ((uint32_t)lk.n - from) * sizeof(look[0]));
+    s->dspark_draft_len = (uint32_t)lk.n;
+    s->dspark_draft_valid = true;
+    if (ds4_dspark_stats_enabled()) {
+        s->dspark_stats.lookup_cycles++;
+        s->dspark_stats.lookup_proposed_tokens += (uint32_t)lk.n - from;
+    }
+}
+
 static bool ds4_session_prepare_dspark_draft(ds4_session *s,
                                              int token,
                                              uint32_t pos) {
@@ -81094,6 +81140,7 @@ static bool ds4_session_prepare_dspark_draft(ds4_session *s,
         g->active_tier = exec_tier;
     }
     const bool ok = ds4_session_prepare_dspark_draft_impl(s, token, pos);
+    if (ok && pos == (uint32_t)s->checkpoint.len) ds4_session_dspark_lookup_fuse(s, token);
     if (exec_tier != saved_tier) {
         g->active_tier = saved_tier;
         if (ds4_gpu_set_current_device(saved_tier) != 0) return false;

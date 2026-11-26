@@ -49,6 +49,14 @@ The scheduler can back off when drafting is unproductive. Defaults select the
 fast paths; diagnostic environment variables are not needed for normal use.
 Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
 
+Greedy DSpark proposals are also combined with drafts taken from the session's
+own history (see V4.1 below for how matches are found). The drafter still runs
+every cycle. A match of eight tokens or more replaces its proposal. A shorter
+match only extends a proposal it fully agrees with. Either way the block can
+grow to one token below the drafter's block size. Stochastic exact-sampling
+cycles and TP runs keep the drafter's proposal unchanged. `DS4_LOOKUP=0` turns
+lookup off for comparison.
+
 For the tested Strix Halo coding configuration, use `--dspark --dspark-confidence 0.7` with the default five-token draft cap and scheduler. Client sampling is temperature `1.0`, `top_p=0.95`, `min_p=0`, and `top_k=0`; high reasoning was also checked on coding and tool-use requests. This uses opportunistic sampling as described below; exact-mode throughput is not qualified by these measurements. `--mtp-draft` controls legacy autoregressive MTP, not the DSpark draft width.
 
 ## DeepSeek V4.1 Flash: DSpark
