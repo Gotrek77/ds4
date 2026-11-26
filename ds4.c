@@ -47,6 +47,7 @@
 #include "ds4_image.h"
 #include "ds4_engram.h"
 #include "ds4_tp.h"
+#include "ds4_lookup.h"
 #if !defined(DS4_NO_GPU)
 #define DS4_HAS_DEEPSEEK41_GPU 1
 #endif
@@ -62974,6 +62975,9 @@ typedef struct ds4_dspark_spec_stats {
     uint64_t tail_skips;
     uint64_t verifier_unavailable;
     uint64_t verifier_errors;
+    uint64_t lookup_cycles;
+    uint64_t lookup_proposed_tokens;
+    uint64_t lookup_accepted_tokens;
     double target_ms;
     double saved_ms;
     double propose_ms;
@@ -76165,6 +76169,17 @@ void ds4_engine_close(ds4_engine *e) {
 }
 
 #ifndef DS4_NO_GPU
+/* Prompt-lookup drafting is part of the release speculative path; DS4_LOOKUP=0
+ * turns it off only to measure what it contributes. */
+static bool ds4_lookup_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_LOOKUP");
+        enabled = !(env && !strcmp(env, "0"));
+    }
+    return enabled != 0;
+}
+
 static bool ds4_dspark_stats_enabled(void) {
     const char *env = getenv("DS4_DSPARK_STATS");
     return env && env[0] && strcmp(env, "0") != 0;
@@ -76277,6 +76292,16 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             net_saved,
             draft_hist,
             accept_hist);
+    if (st->lookup_cycles) {
+        fprintf(stderr,
+                "ds4: prompt lookup cycles=%llu proposed=%llu accepted=%llu accept_rate=%.2f%%\n",
+                (unsigned long long)st->lookup_cycles,
+                (unsigned long long)st->lookup_proposed_tokens,
+                (unsigned long long)st->lookup_accepted_tokens,
+                st->lookup_proposed_tokens ?
+                    100.0 * (double)st->lookup_accepted_tokens /
+                    (double)st->lookup_proposed_tokens : 0.0);
+    }
 }
 #endif
 
@@ -88326,7 +88351,16 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         snprintf(err, errlen, "interrupted");
         return -1;
     }
-    ready = ready && !ds4_session_dspark_scheduler_should_skip(s);
+    /* A long verbatim match in the session's own history is a better draft
+     * than the drafter and costs nothing to propose, so it skips both the
+     * drafter pass and its scheduler (whose acceptance window measures the
+     * drafter alone). */
+    int look[DS41_VERIFY_ROWS - 1u];
+    const ds4_lookup_result lk = ready && ds4_lookup_enabled() ?
+        ds4_lookup_propose(s->checkpoint.v, s->checkpoint.len, first_token, look, cap - 1) :
+        (ds4_lookup_result){0, 0};
+    const bool lookup_only = lk.match >= DS4_LOOKUP_STRONG_MATCH;
+    ready = ready && (lookup_only || !ds4_session_dspark_scheduler_should_skip(s));
     if (!ready) {
         if (stats) s->dspark_stats.no_draft++;
         if (ds4_session_eval(s, first_token, err, errlen)) return -1;
@@ -88335,32 +88369,60 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     }
     const bool exact = temperature > 0 && e->dspark_exact_sampling;
     const double started = now_sec();
-    if (!ds41_session_draft(s, first_token))
-        goto fail;
     int tokens[DS41_VERIFY_ROWS] = {first_token};
-    uint32_t count = 1;
-    for (; count < (uint32_t)cap; count++) {
-        const uint32_t row = count - 1u;
-        float confidence;
-        if (!ds41_dspark_markov(d, &e->mtp_model, row, tokens[row], &confidence)) goto fail;
-        if (e->dspark_confidence_threshold > 0 &&
-            sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
-        const float *qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
-        if (exact) {
-            float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
-            if (!rng || !sample_build_probabilities(qlogits, DS4_N_VOCAB,
-                temperature, top_k, top_p, min_p, q)) goto fail;
-            tokens[count] = sample_probabilities(q, DS4_N_VOCAB, rng);
-        } else tokens[count] = sample_argmax(qlogits, DS4_N_VOCAB);
-        if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
-        if (tokens[count] == eos) { count++; break; }
+    uint32_t count = 1, drafted = 0;
+    if (!lookup_only) {
+        if (!ds41_session_draft(s, first_token))
+            goto fail;
+        for (; count < (uint32_t)cap; count++) {
+            const uint32_t row = count - 1u;
+            float confidence;
+            if (!ds41_dspark_markov(d, &e->mtp_model, row, tokens[row], &confidence)) goto fail;
+            if (e->dspark_confidence_threshold > 0 &&
+                sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
+            const float *qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
+            if (exact) {
+                float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
+                if (!rng || !sample_build_probabilities(qlogits, DS4_N_VOCAB,
+                    temperature, top_k, top_p, min_p, q)) goto fail;
+                tokens[count] = sample_probabilities(q, DS4_N_VOCAB, rng);
+            } else tokens[count] = sample_argmax(qlogits, DS4_N_VOCAB);
+            if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
+            if (tokens[count] == eos) { count++; break; }
+        }
+        drafted = count - 1u;
+    }
+    /* Past a drafter that stopped early, a weaker match may finish the block
+     * when the two independent sources agree on everything drafted so far:
+     * the drafter read the hidden state, the lookup read the text. */
+    const bool lookup_extends = !lookup_only && lk.n > 0 &&
+        drafted >= DS4_LOOKUP_AGREE && drafted < (uint32_t)lk.n &&
+        tokens[drafted] != eos &&
+        !memcmp(tokens + 1, look, drafted * sizeof(tokens[0]));
+    if (lookup_only || lookup_extends) {
+        for (; count < (uint32_t)cap && count - 1u < (uint32_t)lk.n; count++) {
+            tokens[count] = look[count - 1u];
+            if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
+            if (exact) {
+                /* A point-mass proposal keeps exact acceptance exact: accept
+                 * with p(token), otherwise sample the residual p without it. */
+                float *q = d->draft_probs + (uint64_t)(count - 1u) * DS4_N_VOCAB;
+                memset(q, 0, (uint64_t)DS4_N_VOCAB * sizeof(*q));
+                q[tokens[count]] = 1.0f;
+            }
+            if (tokens[count] == eos) { count++; break; }
+        }
+        if (stats) {
+            s->dspark_stats.lookup_cycles++;
+            s->dspark_stats.lookup_proposed_tokens += count - 1u - drafted;
+        }
     }
     if (count == 1) {
         if (stats) {
             s->dspark_stats.no_draft++;
             s->dspark_stats.propose_ms += (now_sec() - started) * 1000;
         }
-        ds4_session_dspark_scheduler_note(s, 0, true, 0.0);
+        if (!lookup_only) ds4_session_dspark_scheduler_note(s, 0, true, 0.0);
         if (ds4_session_eval(s, first_token, err, errlen)) return -1;
         accepted[0] = first_token;
         return 1;
@@ -88398,8 +88460,12 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         accepted[i] = tokens[i];
     }
     const uint32_t accepted_drafts = keep - 1u;
-    ds4_session_dspark_scheduler_note(s, accepted_drafts, false, 0.0);
+    if (!lookup_only)
+        ds4_session_dspark_scheduler_note(s, accepted_drafts < drafted ? accepted_drafts : drafted,
+                                          false, 0.0);
     if (stats) {
+        if (accepted_drafts > drafted)
+            s->dspark_stats.lookup_accepted_tokens += accepted_drafts - drafted;
         s->dspark_stats.verify_ms += (now_sec() - proposed) * 1000;
         s->dspark_stats.accepted_draft_tokens += accepted_drafts;
         ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, accepted_drafts);

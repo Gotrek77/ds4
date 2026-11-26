@@ -77,6 +77,17 @@ before speculation resumes. Measure speed on your prompts: acceptance and SSD
 cache size both matter. V4.1 DSpark can still be slower than ordinary decoding,
 including in TP mode.
 
+V4.1 also drafts from the session's own history. When the last tokens repeat
+an earlier passage, the tokens that followed it are proposed: this is what
+code edits, repeated commands and quoted documents look like. A match of eight
+tokens or more is verified on its own, without running the drafter. A shorter
+match only finishes a block the drafter stopped early, and only when it agrees
+with everything the drafter proposed. Lookup proposals pass through the same
+verification as drafter proposals. Under `--mtp-exact-sampling` they are
+point-mass proposals, so the sampling distribution is unchanged. `DS4_LOOKUP=0`
+turns lookup off for comparison. `DS4_DSPARK_STATS=1` reports its cycles and
+acceptance.
+
 ## GLM: built-in MTP
 
 GLM's draft block is already in its main GGUF:
