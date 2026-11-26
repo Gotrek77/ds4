@@ -556,6 +556,18 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
                                                int (*accepted)[2], int *n_accepted,
                                                char *err, size_t errlen);
+/* One speculative cycle for a batch of sessions, committing up to
+ * DS4_SPEC_BLOCK_MAX tokens each (DeepSeek V4.1 with DSpark: drafter and
+ * prompt-lookup drafts verified in one shared step; Qwen3.8 MTP: one draft).
+ * Acceptance is greedy: each item feeds its already sampled token and drafts
+ * are committed while they are the target's argmax.  limits[i] bounds the
+ * tokens committed for item i; accepted[i] lists them, the fed token first,
+ * and n_accepted[i] how many.  The session's logits then follow its last
+ * committed token.  Unsupported combinations run ordered cycles. */
+#define DS4_SPEC_BLOCK_MAX 8
+int ds4_sessions_eval_batch_speculative(ds4_decode_item *items, int count, const int *limits,
+                                        int eos_token, int (*accepted)[DS4_SPEC_BLOCK_MAX],
+                                        int *n_accepted, char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */

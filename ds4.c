@@ -44240,7 +44240,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
-    const bool prefill_only = prefill_rows == rows && !g->verify_prefix;
+    /* Rows among the first prefill_rows continue the previous row when both
+     * belong to one sequence (the same graph, or verify row graphs sharing
+     * its caches).  Each run of such rows is one prompt or verify segment;
+     * several sessions' verify segments can share the batch. */
+    bool continues[DS4_TP_BATCH_MAX_ROWS] = {false};
+    bool one_sequence = true;
+    for (int i = 1; i < count; i++) {
+        const bool same = graphs[i] == graphs[i - 1] || graphs[i]->window[0] == graphs[i - 1]->window[0];
+        continues[i] = same && (uint32_t)i < prefill_rows;
+        one_sequence = one_sequence && same;
+    }
+    const bool prefill_only = prefill_rows == rows && !g->verify_prefix && one_sequence;
     const bool batch_queue = g->tp_world != 2 &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_DECODE_PIPELINE");
     const bool shared_owner = g->tp_world == 2 &&
@@ -44284,8 +44295,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     ds4_engram_prefetch *reads[DS4_TP_BATCH_MAX_ROWS][2] = {{NULL}};
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
-        const bool continued = i > 0 && (uint32_t)i < prefill_rows;
-        positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
+        const bool continued = continues[i];
+        positions[i] = continued ? positions[i - 1] + 1u : s->pos;
         history[i] = continued ? history[i - 1] : s->history;
         ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[i][0][0]);
         for (unsigned table = 0; ok && !batch_read && table < 2; table++) {
@@ -82004,26 +82015,34 @@ static bool glm53_graph_encode_native_session_batch(
 }
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+static bool ds41_backend_rows_supported(const ds4_engine *e) {
+    return e->backend == DS4_BACKEND_CUDA ?
+        metal_graph_tp_env_flag("DS4_CUDA_SESSION_BATCH_MOE", true) :
+        e->backend == DS4_BACKEND_METAL && !getenv("DS4_METAL_DISABLE_V41_SESSION_BATCH");
+}
+
+/* Whether a session's graph can be one or more rows of ds41_graph_step_batch. */
+static bool ds41_session_rows_supported(const ds4_session *s, const ds4_engine *e) {
+    return s && s->engine == e && s->ds41_graph_ready && s->checkpoint_valid && !s->distributed &&
+        (e->backend == DS4_BACKEND_CUDA ? ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) :
+                                          !s->ds41_graph.streaming) &&
+        !s->ds41_graph.imatrix && !s->ds41_graph.quality &&
+        s->ds41_graph.valid && !s->ds41_graph.image_count &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len;
+}
+
 static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
                                           const ds4_engine *e) {
     if (!items || count < 2 || count > DS4_TP_BATCH_MAX_ROWS || !e ||
-        e->support_kind != DS4_SUPPORT_NONE)
-        return false;
-    const bool cuda = e->backend == DS4_BACKEND_CUDA;
-    if (cuda ? !metal_graph_tp_env_flag("DS4_CUDA_SESSION_BATCH_MOE", true) :
-        (e->backend != DS4_BACKEND_METAL || getenv("DS4_METAL_DISABLE_V41_SESSION_BATCH")))
+        e->support_kind != DS4_SUPPORT_NONE || !ds41_backend_rows_supported(e))
         return false;
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
-        if (!s || s->engine != e || !s->ds41_graph_ready || !s->checkpoint_valid || s->distributed ||
-            (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) : s->ds41_graph.streaming) ||
-            s->ds41_graph.imatrix || s->ds41_graph.quality ||
-            !s->ds41_graph.valid || s->ds41_graph.image_count ||
-            s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return false;
+        if (!ds41_session_rows_supported(s, e)) return false;
         /* Smaller TP batches lose to ordered decode. Single-host execution
          * starts at two; the network crossover is backend-specific. */
-        if (s->ds41_graph.tp_world == 2 && count < (cuda ? 5 : 3)) return false;
+        if (s->ds41_graph.tp_world == 2 && count < (e->backend == DS4_BACKEND_CUDA ? 5 : 3)) return false;
         graphs[i] = &s->ds41_graph;
     }
     return ds41_batch_workspace(graphs, count) != NULL;
@@ -83963,6 +83982,55 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         accepted[i][1] = n > 1 ? toks[1] : -1;
     }
     return 0;
+}
+
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+static int ds41_sessions_speculate_batch(ds4_decode_item *items, int count, const int *limits,
+        int eos, int (*accepted)[DS4_SPEC_BLOCK_MAX], int *n_accepted, char *err, size_t errlen);
+#endif
+
+int ds4_sessions_eval_batch_speculative(ds4_decode_item *items, int count, const int *limits,
+                                        int eos_token, int (*accepted)[DS4_SPEC_BLOCK_MAX],
+                                        int *n_accepted, char *err, size_t errlen) {
+    if (!items || count <= 0 || !limits || !accepted || !n_accepted || !items[0].session) {
+        if (err && errlen) snprintf(err, errlen, "empty speculative decode batch");
+        return 1;
+    }
+    ds4_engine *e = items[0].session->engine;
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s || s->engine != e || !e) {
+            if (err && errlen) snprintf(err, errlen, "decode batch item %d belongs to a different engine", i);
+            return 1;
+        }
+        if (items[i].token < 0 || items[i].token >= (int)DS4_N_VOCAB) {
+            if (err && errlen) snprintf(err, errlen, "decode batch item %d has an invalid token", i);
+            return 1;
+        }
+        for (int j = 0; j < i; j++) {
+            if (items[j].session == s) {
+                if (err && errlen) snprintf(err, errlen, "decode batch repeats session at items %d and %d", j, i);
+                return 1;
+            }
+        }
+        if (s->checkpoint.len >= s->ctx_size) {
+            if (err && errlen) snprintf(err, errlen, "decode batch item %d reached its context limit", i);
+            return 1;
+        }
+    }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (ds4_session_is_ds41(items[0].session))
+        return ds41_sessions_speculate_batch(items, count, limits, eos_token,
+                                             accepted, n_accepted, err, errlen);
+#else
+    (void)eos_token;
+#endif
+    /* Qwen3.8 MTP verifies one draft per session. */
+    int (*pairs)[2] = xmalloc((size_t)count * sizeof(*pairs));
+    const int rc = ds4_sessions_eval_batch_speculative_argmax(items, count, pairs, n_accepted, err, errlen);
+    for (int i = 0; rc == 0 && i < count; i++) memcpy(accepted[i], pairs[i], (size_t)n_accepted[i] * sizeof(int));
+    free(pairs);
+    return rc;
 }
 
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
@@ -88324,19 +88392,37 @@ int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
     return 0;
 }
 #endif
-static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int eos,
-        bool ignore_eos, ds4_think_mode think_mode, float temperature, int top_k,
-        float top_p, float min_p, uint64_t *rng, int *accepted, char *err, size_t errlen) {
+/* One proposed verify block: tokens[0] is the fed token, tokens[1..count)
+ * the drafts, of which the first `drafted` came from the DSpark drafter and
+ * the rest from prompt lookup. */
+#define DS41_PROPOSE_CANCELLED (-2)
+
+typedef struct {
+    int tokens[DS41_VERIFY_ROWS];
+    uint32_t count, drafted;
+    bool lookup_only;
+    double started;
+} ds41_proposal;
+
+/* Propose drafts after first_token.  Returns 1 with a block of at least two
+ * rows, 0 when the token should be decoded on its own (nothing is changed),
+ * DS41_PROPOSE_CANCELLED when the session was cancelled (nothing is changed),
+ * or -1 after invalidating the session.  Without allow_drafter only a strong
+ * lookup match is proposed and the drafter scheduler is left untouched. */
+static int ds41_session_propose(ds4_session *s, int first_token, int cap, int eos,
+        bool ignore_eos, ds4_think_mode think_mode, bool allow_drafter, float temperature,
+        int top_k, float top_p, float min_p, uint64_t *rng, bool exact, ds41_proposal *p) {
     ds4_engine *e = s->engine;
     ds41_gpu_graph *g = &s->ds41_graph;
     ds41_dspark *d = g->dspark;
-    if (!accepted || cap < 1 || !s->checkpoint_valid || !g->valid ||
-        g->pos != (uint32_t)s->checkpoint.len) return -1;
+    p->count = 1;
+    p->drafted = 0;
+    p->lookup_only = false;
+    p->tokens[0] = first_token;
     if (cap > (int)(g->ctx - g->pos)) cap = (int)(g->ctx - g->pos);
-    if (cap < 1) return 0;
     if (cap > (int)DS41_VERIFY_ROWS) cap = DS41_VERIFY_ROWS;
     const uint32_t draft_cap = ds4_dspark_env_u32("DS4_DSPARK_VERIFY_CAP", 0);
-    if (draft_cap && draft_cap < (uint32_t)cap - 1u) cap = (int)draft_cap + 1;
+    if (draft_cap && cap > 1 && draft_cap < (uint32_t)cap - 1u) cap = (int)draft_cap + 1;
     const bool stats = ds4_dspark_stats_enabled();
     if (stats) { s->dspark_stats.cycles++; s->dspark_stats.first_tokens++; }
     bool ready = d && !e->quality && !e->dspark_strict && cap > 1 &&
@@ -88347,10 +88433,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     if (ready) for (uint32_t pos = g->pos > 128u ? g->pos - 128u : 0; pos < g->pos; pos++)
         for (unsigned stage = 0; stage < 3; stage++)
             ready = ready && d->positions[stage][pos % 128u] == pos;
-    if (ready && ds4_session_cancelled(s)) {
-        snprintf(err, errlen, "interrupted");
-        return -1;
-    }
+    if (ready && ds4_session_cancelled(s)) return DS41_PROPOSE_CANCELLED;
     /* A long verbatim match in the session's own history is a better draft
      * than the drafter and costs nothing to propose, so it skips both the
      * drafter pass and its scheduler (whose acceptance window measures the
@@ -88360,20 +88443,18 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         ds4_lookup_propose(s->checkpoint.v, s->checkpoint.len, first_token, look, cap - 1) :
         (ds4_lookup_result){0, 0};
     const bool lookup_only = lk.match >= DS4_LOOKUP_STRONG_MATCH;
-    ready = ready && (lookup_only || !ds4_session_dspark_scheduler_should_skip(s));
+    ready = ready && (lookup_only ||
+        (allow_drafter && !ds4_session_dspark_scheduler_should_skip(s)));
     if (!ready) {
         if (stats) s->dspark_stats.no_draft++;
-        if (ds4_session_eval(s, first_token, err, errlen)) return -1;
-        accepted[0] = first_token;
-        return 1;
+        return 0;
     }
-    const bool exact = temperature > 0 && e->dspark_exact_sampling;
-    const double started = now_sec();
-    int tokens[DS41_VERIFY_ROWS] = {first_token};
-    uint32_t count = 1, drafted = 0;
+    p->lookup_only = lookup_only;
+    p->started = now_sec();
+    int *tokens = p->tokens;
+    uint32_t count = 1;
     if (!lookup_only) {
-        if (!ds41_session_draft(s, first_token))
-            goto fail;
+        if (!ds41_session_draft(s, first_token)) goto fail;
         for (; count < (uint32_t)cap; count++) {
             const uint32_t row = count - 1u;
             float confidence;
@@ -88390,11 +88471,12 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
             if (tokens[count] == eos) { count++; break; }
         }
-        drafted = count - 1u;
+        p->drafted = count - 1u;
     }
     /* Past a drafter that stopped early, a weaker match may finish the block
      * when the two independent sources agree on everything drafted so far:
      * the drafter read the hidden state, the lookup read the text. */
+    const uint32_t drafted = p->drafted;
     const bool lookup_extends = !lookup_only && lk.n > 0 &&
         drafted >= DS4_LOOKUP_AGREE && drafted < (uint32_t)lk.n &&
         tokens[drafted] != eos &&
@@ -88417,12 +88499,76 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             s->dspark_stats.lookup_proposed_tokens += count - 1u - drafted;
         }
     }
+    p->count = count;
     if (count == 1) {
         if (stats) {
             s->dspark_stats.no_draft++;
-            s->dspark_stats.propose_ms += (now_sec() - started) * 1000;
+            s->dspark_stats.propose_ms += (now_sec() - p->started) * 1000;
         }
         if (!lookup_only) ds4_session_dspark_scheduler_note(s, 0, true, 0.0);
+        return 0;
+    }
+    if (stats) {
+        s->dspark_stats.propose_ms += (now_sec() - p->started) * 1000;
+        s->dspark_stats.proposed_tokens += count - 1u;
+        ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, count - 1u);
+    }
+    return 1;
+fail:
+    if (ds4_gpu_commands_active()) (void)ds4_gpu_end_commands();
+    g->valid = s->checkpoint_valid = false;
+    if (stats) s->dspark_stats.verifier_errors++;
+    return -1;
+}
+
+/* Account one committed verify block: lookup rows are never credited to the
+ * drafter scheduler, which decides only whether the drafter pays. */
+static void ds41_session_note_verified(ds4_session *s, const ds41_proposal *p,
+                                       uint32_t keep, double proposed) {
+    const uint32_t accepted_drafts = keep - 1u;
+    if (!p->lookup_only)
+        ds4_session_dspark_scheduler_note(s, accepted_drafts < p->drafted ? accepted_drafts : p->drafted,
+                                          false, 0.0);
+    if (!ds4_dspark_stats_enabled()) return;
+    if (accepted_drafts > p->drafted)
+        s->dspark_stats.lookup_accepted_tokens += accepted_drafts - p->drafted;
+    s->dspark_stats.verify_ms += (now_sec() - proposed) * 1000;
+    s->dspark_stats.accepted_draft_tokens += accepted_drafts;
+    ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, accepted_drafts);
+    if (keep == p->count) {
+        s->dspark_stats.full_accepts++;
+        s->dspark_stats.direct_full_commits++;
+    } else {
+        s->dspark_stats.partial_accepts++;
+        s->dspark_stats.direct_partial_commits++;
+    }
+}
+
+static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int eos,
+        bool ignore_eos, ds4_think_mode think_mode, float temperature, int top_k,
+        float top_p, float min_p, uint64_t *rng, int *accepted, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_dspark *d = g->dspark;
+    if (!accepted || cap < 1 || !s->checkpoint_valid || !g->valid ||
+        g->pos != (uint32_t)s->checkpoint.len) return -1;
+    if (cap > (int)(g->ctx - g->pos)) cap = (int)(g->ctx - g->pos);
+    if (cap < 1) return 0;
+    const bool stats = ds4_dspark_stats_enabled();
+    const bool exact = temperature > 0 && e->dspark_exact_sampling;
+    ds41_proposal p;
+    const int proposed_rc = ds41_session_propose(s, first_token, cap, eos, ignore_eos,
+        think_mode, true, temperature, top_k, top_p, min_p, rng, exact, &p);
+    if (proposed_rc == DS41_PROPOSE_CANCELLED) {
+        snprintf(err, errlen, "interrupted");
+        return -1;
+    }
+    if (proposed_rc < 0) {
+        snprintf(err, errlen, "V4.1 DSpark draft failed at position %u", g->pos);
+        if (e->tp.active) ds4_tp_mark_failed(e->tp.ctx);
+        return -1;
+    }
+    if (proposed_rc == 0) {
         if (ds4_session_eval(s, first_token, err, errlen)) return -1;
         accepted[0] = first_token;
         return 1;
@@ -88431,12 +88577,9 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         snprintf(err, errlen, "interrupted");
         return -1;
     }
+    const int *tokens = p.tokens;
+    const uint32_t count = p.count;
     const double proposed = now_sec();
-    if (stats) {
-        s->dspark_stats.propose_ms += (proposed - started) * 1000;
-        s->dspark_stats.proposed_tokens += count - 1u;
-        ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, count - 1u);
-    }
     if (!ds41_session_verify(s, tokens, count)) goto fail;
     uint32_t keep = 1;
     int correction = -1;
@@ -88460,23 +88603,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         accepted[i] = tokens[i];
     }
     const uint32_t accepted_drafts = keep - 1u;
-    if (!lookup_only)
-        ds4_session_dspark_scheduler_note(s, accepted_drafts < drafted ? accepted_drafts : drafted,
-                                          false, 0.0);
-    if (stats) {
-        if (accepted_drafts > drafted)
-            s->dspark_stats.lookup_accepted_tokens += accepted_drafts - drafted;
-        s->dspark_stats.verify_ms += (now_sec() - proposed) * 1000;
-        s->dspark_stats.accepted_draft_tokens += accepted_drafts;
-        ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, accepted_drafts);
-        if (keep == count) {
-            s->dspark_stats.full_accepts++;
-            s->dspark_stats.direct_full_commits++;
-        } else {
-            s->dspark_stats.partial_accepts++;
-            s->dspark_stats.direct_partial_commits++;
-        }
-    }
+    ds41_session_note_verified(s, &p, keep, proposed);
     if (correction >= 0) {
         if (ds4_session_eval(s, correction, err, errlen)) return -1;
         accepted[keep++] = correction;
@@ -88486,8 +88613,8 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     }
     if (getenv("DS4_DSPARK_SPEC_LOG")) fprintf(stderr,
         "ds4: V4.1 DSpark proposed=%u accepted=%u draft=%.3f ms verify=%.3f ms\n",
-        count - 1u, accepted_drafts, (proposed - started) * 1000, (now_sec() - proposed) * 1000);
-    if (stats) s->dspark_stats.total_ms += (now_sec() - started) * 1000;
+        count - 1u, accepted_drafts, (proposed - p.started) * 1000, (now_sec() - proposed) * 1000);
+    if (stats) s->dspark_stats.total_ms += (now_sec() - p.started) * 1000;
     return (int)keep;
 fail:
     if (ds4_gpu_commands_active()) (void)ds4_gpu_end_commands();
@@ -88496,6 +88623,156 @@ fail:
     snprintf(err, errlen, "V4.1 DSpark draft/verification failed at position %u", g->pos);
     if (e->tp.active) ds4_tp_mark_failed(e->tp.ctx);
     return -1;
+}
+
+/* Ordered fallback: one complete speculative cycle per session. */
+static int ds4_sessions_speculate_ordered(ds4_decode_item *items, int count, const int *limits,
+        int eos, int (*accepted)[DS4_SPEC_BLOCK_MAX], int *n_accepted, char *err, size_t errlen) {
+    for (int i = 0; i < count; i++) {
+        const int limit = limits[i] < 1 ? 1 : limits[i] > DS4_SPEC_BLOCK_MAX ? DS4_SPEC_BLOCK_MAX : limits[i];
+        const int n = ds4_session_eval_speculative_argmax(items[i].session, items[i].token, limit, eos,
+                                                          accepted[i], DS4_SPEC_BLOCK_MAX, err, errlen);
+        if (n <= 0) {
+            for (int j = 0; j < count; j++) ds4_session_invalidate(items[j].session);
+            if (n == 0 && err && errlen) snprintf(err, errlen, "speculative decode committed nothing");
+            return 1;
+        }
+        n_accepted[i] = n;
+    }
+    return 0;
+}
+
+static bool ds41_spec_batch_supported(ds4_decode_item *items, int count, const ds4_engine *e) {
+    if (count < 1 || count > DS4_TP_BATCH_MAX_ROWS || e->tp.active || e->quality ||
+        e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark || !ds41_backend_rows_supported(e))
+        return false;
+    for (int i = 0; i < count; i++) {
+        const ds4_session *s = items[i].session;
+        if (!ds41_session_rows_supported(s, e) || !s->ds41_graph.dspark ||
+            s->ds41_graph.prefill_cap < DS4_TP_BATCH_MAX_ROWS) return false;
+    }
+    return true;
+}
+
+/* Several sessions' verify blocks share one target step.
+ *
+ * The step has DS4_TP_BATCH_MAX_ROWS rows.  Every session needs one for the
+ * token it feeds; the spare rows are split evenly as draft budget, so the
+ * more sessions are decoding the less each speculates, and with as many
+ * sessions as rows this is plain batched decode.  Lookup drafts cost nothing
+ * to propose.  The drafter runs only for a share of at least two rows: its
+ * own pass costs more than a single row can return.
+ *
+ * Acceptance is greedy, as in the single-session opportunistic mode: the fed
+ * token was sampled by the caller, drafts are committed while they match the
+ * target's argmax.  Verify segments go first so the batch workspace is a
+ * verify row graph, as in single-session verification. */
+static int ds41_sessions_speculate_batch(ds4_decode_item *items, int count, const int *limits,
+        int eos, int (*accepted)[DS4_SPEC_BLOCK_MAX], int *n_accepted, char *err, size_t errlen) {
+    ds4_engine *e = items[0].session->engine;
+    if (!ds41_spec_batch_supported(items, count, e))
+        return ds4_sessions_speculate_ordered(items, count, limits, eos, accepted, n_accepted, err, errlen);
+    ds41_proposal p[DS4_TP_BATCH_MAX_ROWS];
+    const int spare = DS4_TP_BATCH_MAX_ROWS - count;
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        const int budget = spare / count + (i < spare % count ? 1 : 0);
+        int cap = 1 + budget;
+        if (cap > limits[i]) cap = limits[i];
+        const int rc = cap > 1 ? ds41_session_propose(s, items[i].token, cap, eos, false,
+            DS4_THINK_HIGH, budget >= 2, 0.0f, 0, 1.0f, 0.0f, NULL, false, &p[i]) : 0;
+        if (rc == -1) {
+            snprintf(err, errlen, "V4.1 DSpark batch draft failed");
+            goto fail;
+        }
+        /* A cancelled member still decodes its fed token: the other members'
+         * requests must not fail with it.  The caller sees the cancellation. */
+        if (rc != 1) {
+            p[i].count = 1;
+            p[i].drafted = 0;
+            p[i].lookup_only = false;
+            p[i].tokens[0] = items[i].token;
+        }
+    }
+    if (count == 1 && p[0].count == 1) {
+        if (ds4_session_eval(items[0].session, items[0].token, err, errlen)) goto fail;
+        accepted[0][0] = items[0].token;
+        n_accepted[0] = 1;
+        return 0;
+    }
+
+    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
+    int tokens[DS4_TP_BATCH_MAX_ROWS];
+    int rows = 0;
+    bool ok = true;
+    /* Block-start logits back the zero-prefix rewind, as in ds41_session_verify. */
+    for (int i = 0; ok && i < count; i++)
+        if (p[i].count > 1)
+            ok = ds4_gpu_tensor_write(items[i].session->ds41_graph.logits, 0,
+                items[i].session->logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    ok = ok && ds4_gpu_begin_commands();
+    for (int pass = 0; ok && pass < 2; pass++) {
+        for (int i = 0; ok && i < count; i++) {
+            ds41_gpu_graph *g = &items[i].session->ds41_graph;
+            const uint32_t n = p[i].count;
+            if ((n > 1) != (pass == 0)) continue;
+            if (n > 1) ok = ds41_dspark_verify_ready(g->dspark, g, n) &&
+                ds41_dspark_verify_rows(g->dspark, g, n, graphs + rows);
+            else graphs[rows] = g;
+            memcpy(tokens + rows, p[i].tokens, n * sizeof(tokens[0]));
+            rows += (int)n;
+        }
+    }
+    const double proposed = now_sec();
+    ok = ok && ds41_graph_step_batch(graphs, tokens, rows, (uint32_t)rows, &e->model, &e->weights);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (!ok) {
+        snprintf(err, errlen, "V4.1 DSpark batch verification failed");
+        goto fail;
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        ds41_gpu_graph *g = &s->ds41_graph;
+        const uint32_t n = p[i].count;
+        if (n == 1) {
+            if (!ds4_gpu_tensor_read(g->logits, 0, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+                snprintf(err, errlen, "V4.1 batch logits read failed");
+                goto fail;
+            }
+            token_vec_push(&s->checkpoint, items[i].token);
+            s->checkpoint_valid = true;
+            accepted[i][0] = items[i].token;
+            n_accepted[i] = 1;
+            continue;
+        }
+        ds41_dspark *d = g->dspark;
+        if (!ds41_dspark_verify_read(d, g, n)) {
+            snprintf(err, errlen, "V4.1 batch verify read failed");
+            goto fail;
+        }
+        uint32_t keep = 1;
+        while (keep < n && sample_argmax(d->host_verified + (uint64_t)(keep - 1u) * DS4_N_VOCAB,
+                                         DS4_N_VOCAB) == p[i].tokens[keep]) keep++;
+        if (!ds41_session_commit(s, p[i].tokens, n, keep)) {
+            snprintf(err, errlen, "V4.1 batch verify commit failed");
+            goto fail;
+        }
+        ds41_session_note_verified(s, &p[i], keep, proposed);
+        if (ds4_dspark_stats_enabled()) s->dspark_stats.total_ms += (now_sec() - p[i].started) * 1000;
+        memcpy(accepted[i], p[i].tokens, keep * sizeof(int));
+        n_accepted[i] = (int)keep;
+    }
+    if (getenv("DS4_DSPARK_SPEC_LOG")) {
+        int committed = 0;
+        for (int i = 0; i < count; i++) committed += n_accepted[i];
+        fprintf(stderr, "ds4: V4.1 batch sessions=%d rows=%d committed=%d step=%.3f ms\n",
+                count, rows, committed, (now_sec() - proposed) * 1000);
+    }
+    return 0;
+fail:
+    if (ds4_gpu_commands_active()) (void)ds4_gpu_end_commands();
+    for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+    return 1;
 }
 #endif
 

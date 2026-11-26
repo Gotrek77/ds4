@@ -10054,7 +10054,8 @@ struct server_slot {
     bool decode_done;
     int decode_token;
     bool decode_speculative;
-    int decode_accepted[2];
+    int decode_limit;
+    int decode_accepted[DS4_SPEC_BLOCK_MAX];
     int decode_accepted_count;
     int decode_rc;
     char decode_err[160];
@@ -10179,7 +10180,9 @@ struct server {
     pthread_mutex_t model_mu;
     pthread_cond_t model_cv;
     bool model_busy;
-    bool qwen4_batch_mtp;
+    /* Batched slots verify drafts together (Qwen3.8 MTP on Metal, DeepSeek
+     * V4.1 DSpark and prompt lookup). */
+    bool batch_speculative;
     bool model_stopping;
     int decode_pending;
     int active_generations;
@@ -13209,8 +13212,10 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
     return true;
 }
 
+/* Feed token and, when speculative, commit up to limit tokens; accepted
+ * holds DS4_SPEC_BLOCK_MAX entries. */
 static int server_eval_tokens(server *s, server_slot *slot, int token,
-                              bool speculative, int accepted[2], int *n_accepted,
+                              bool speculative, int limit, int *accepted, int *n_accepted,
                               char *err, size_t errlen) {
     *n_accepted = 0;
     if (!s || !slot) return 1;
@@ -13243,6 +13248,7 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
     }
     slot->decode_token = token;
     slot->decode_speculative = speculative;
+    slot->decode_limit = limit;
     slot->decode_accepted_count = 0;
     slot->decode_rc = 1;
     slot->decode_err[0] = '\0';
@@ -13283,8 +13289,8 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
 
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen) {
-    int accepted[2], count;
-    return server_eval_tokens(s, slot, token, false, accepted, &count, err, errlen);
+    int accepted[DS4_SPEC_BLOCK_MAX], count;
+    return server_eval_tokens(s, slot, token, false, 1, accepted, &count, err, errlen);
 }
 
 static long server_decode_coalesce_us(void) {
@@ -13309,8 +13315,10 @@ static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
-    int (*accepted)[2] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
+    int (*accepted)[DS4_SPEC_BLOCK_MAX] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
     int *n_accepted = xmalloc((size_t)s->slot_count * sizeof(*n_accepted));
+    int *limits = xmalloc((size_t)s->slot_count * sizeof(*limits));
+    const int eos_token = ds4_token_eos(s->engine);
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
@@ -13353,6 +13361,7 @@ static void *decode_worker_main(void *arg) {
                 members[count] = slot;
                 items[count].session = slot->session;
                 items[count].token = slot->decode_token;
+                limits[count] = slot->decode_limit;
                 count++;
             }
             if (!speculative) plain_count = count;
@@ -13371,8 +13380,9 @@ static void *decode_worker_main(void *arg) {
             n_accepted[i] = 1;
         }
         if (rc == 0 && count > plain_count)
-            rc = ds4_sessions_eval_batch_speculative_argmax(items + plain_count, count - plain_count,
-                    accepted + plain_count, n_accepted + plain_count, batch_err, sizeof(batch_err));
+            rc = ds4_sessions_eval_batch_speculative(items + plain_count, count - plain_count,
+                    limits + plain_count, eos_token, accepted + plain_count,
+                    n_accepted + plain_count, batch_err, sizeof(batch_err));
         if (rc != 0)
             for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
         pthread_mutex_unlock(&s->inference_mu);
@@ -13406,6 +13416,7 @@ static void *decode_worker_main(void *arg) {
     free(items);
     free(accepted);
     free(n_accepted);
+    free(limits);
     return NULL;
 }
 
@@ -14029,11 +14040,12 @@ decode_again:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && s->qwen4_batch_mtp &&
+        } else if (s->batched_mode && s->batch_speculative &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
-            if (server_eval_tokens(s, slot, token, true, toks, &ntok, err, sizeof(err)) != 0) {
+            if (server_eval_tokens(s, slot, token, true, max_tokens - completion,
+                                   toks, &ntok, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }
@@ -15976,8 +15988,9 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
-    s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
-                       ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
+    s.batch_speculative = ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        ((cfg.engine.backend == DS4_BACKEND_METAL && ds4_engine_is_qwen4(engine)) ||
+         ds4_engine_is_deepseek41(engine));
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
@@ -16033,7 +16046,7 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, false),
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
-        if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
+        if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.batch_speculative) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }

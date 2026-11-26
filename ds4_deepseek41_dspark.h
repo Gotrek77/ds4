@@ -349,20 +349,19 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
 /* Cache appends beyond the accepted frontier are invisible. Only the six
  * overwritten raw-ring slots and pooling carries need rollback; no compressed
  * cache proportional to the context is copied. */
-static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
-        const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
-    if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
-        g->pos > g->ctx || count > g->ctx - g->pos || !ds41_tp_batch_enabled(g)) return false;
-    /* Prepost the complete small-row exchange window, as in V4.0 verification.
-     * Bulk-prefill handshakes at every attention/FFN gate are too expensive. */
-    const bool tp_block = g->tp_world == 2;
-    uint32_t gates = 2;
-    if (tp_block && (!g->tp_batch_out || !g->tp_batch_in || !g_tp_block_ctx ||
-        !ds4_tp_batch_block_begin_gates(g_tp_block_ctx, count, DS4_N_LAYER, &gates) ||
-        gates != 2)) return false;
+static bool ds41_dspark_verify_ready(const ds41_dspark *d, const ds41_gpu_graph *g, uint32_t count) {
+    return d && g->valid && count >= 2 && count <= DS41_VERIFY_ROWS &&
+        g->pos <= g->ctx && count <= g->ctx - g->pos && ds41_tp_batch_enabled(g);
+}
+
+/* Encode the rollback copies for one verify block and point graphs[0..count)
+ * at its private row graphs.  The rows then run in any ds41_graph_step_batch,
+ * alone or beside other sessions' rows; ds41_dspark_verify_read collects the
+ * logits once the commands have completed. */
+static bool ds41_dspark_verify_rows(ds41_dspark *d, ds41_gpu_graph *g, uint32_t count,
+                                    ds41_gpu_graph **graphs) {
     const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
-    ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
-    bool ok = ds4_gpu_begin_commands();
+    bool ok = true;
     d->verify_start = g->pos;
     d->verify_count = 0;
     d->rewind_end = 0;
@@ -417,19 +416,40 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
                     ds4_gpu_tensor_copy(row->verify_previous_score[owner], 0, g->previous_score[owner], 0, kv);
         }
     }
-    if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
-    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
-    if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
-        ds4_tp_mark_failed(g_tp_block_ctx);
-        ok = false;
-    }
-    if (ok) ok = ds4_gpu_tensor_read(d->verify_logits, 0, d->host_verified,
+    return ok;
+}
+
+static bool ds41_dspark_verify_read(ds41_dspark *d, ds41_gpu_graph *g, uint32_t count) {
+    const bool ok = ds4_gpu_tensor_read(d->verify_logits, 0, d->host_verified,
         (uint64_t)count * DS4_N_VOCAB * 4u) &&
         ds4_gpu_tensor_read(d->verify_logits, (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB * 4u,
             d->host_verified + (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB, DS4_N_VOCAB * 4u);
     if (ok) d->verify_count = count;
     else g->valid = false;
     return ok;
+}
+
+static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
+        const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
+    if (!ds41_dspark_verify_ready(d, g, count)) return false;
+    /* Prepost the complete small-row exchange window, as in V4.0 verification.
+     * Bulk-prefill handshakes at every attention/FFN gate are too expensive. */
+    const bool tp_block = g->tp_world == 2;
+    uint32_t gates = 2;
+    if (tp_block && (!g->tp_batch_out || !g->tp_batch_in || !g_tp_block_ctx ||
+        !ds4_tp_batch_block_begin_gates(g_tp_block_ctx, count, DS4_N_LAYER, &gates) ||
+        gates != 2)) return false;
+    ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
+    bool ok = ds4_gpu_begin_commands() && ds41_dspark_verify_rows(d, g, count, graphs);
+    if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
+        ds4_tp_mark_failed(g_tp_block_ctx);
+        ok = false;
+    }
+    if (ok) return ds41_dspark_verify_read(d, g, count);
+    g->valid = false;
+    return false;
 }
 
 static DS4_MAYBE_UNUSED bool ds41_dspark_commit(ds41_dspark *d, ds41_gpu_graph *g,

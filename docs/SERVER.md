@@ -89,11 +89,20 @@ use the ordered fallback.
 Long prefills yield to active decoders in bounded intervals, normally 128
 tokens. `--mixed-prefill-quantum N` changes that interval for testing. While
 nothing is decoding, a V4.1 slot prefills in the engine's own chunk.
-Session-batched serving uses ordinary target decoding, except Qwen3.8 on
-Metal, where `--mtp` also batches speculative decoding with resident weights
-and uses ordered speculative cycles with SSD expert streaming. Its
-`--mtp-exact-sampling` mode uses ordinary batches for nonzero-temperature
-requests. Other models do not use MTP/DSpark while session batching is active.
+Session-batched serving uses ordinary target decoding, with two exceptions.
+Qwen3.8 on Metal with `--mtp` batches speculative decoding when weights are
+resident, and runs ordered speculative cycles with SSD expert streaming.
+DeepSeek V4.1 with DSpark puts every session's drafts into one shared verify
+step of at most eight rows. Each session takes one row for its own token. The
+spare rows are split evenly as draft budget: two sessions get three drafts
+each, eight sessions get none. Prompt-lookup drafts are always proposed when
+they fit. The drafter runs only for sessions whose share is at least two rows.
+On a backend without native V4.1 session batching (SSD streaming, TP) the
+sessions run ordered speculative cycles instead. With
+`--mtp-exact-sampling`, both models use ordinary batches for
+nonzero-temperature requests. Other models do not use MTP or DSpark while
+session batching is active. `DS4_MTP_SPEC_DISABLE=1` turns batched
+speculation off for comparison.
 For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-users).
 
 ## Images

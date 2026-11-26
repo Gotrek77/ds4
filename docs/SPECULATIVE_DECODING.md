@@ -186,5 +186,6 @@ target-only path, use `--quality` or `--dspark-strict`; these disable the
 speculative acceptance path. They do not promise identical output across
 different hardware or execution configurations.
 
-Session-batched serving uses ordinary target decoding instead of combining
-DSpark/MTP with the session batch. See [serving](SERVER.md#multiple-sessions).
+Session-batched serving combines speculation with the session batch only for
+Qwen3.8 MTP and V4.1 DSpark, with greedy acceptance. Other models use ordinary
+target decoding there. See [serving](SERVER.md#multiple-sessions).
