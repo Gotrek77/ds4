@@ -76395,7 +76395,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 free(s);
                 return 1;
             }
-            s->ds41_graph.allocation_bytes += UINT64_C(64) << 20;
+            /* DSpark per-session 64 MiB is already reserved by ds41_fixed_memory(); counting it here too made every session after the first fail admission. */
         }
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
